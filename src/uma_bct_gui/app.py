@@ -7,12 +7,16 @@ from pathlib import Path
 
 import flet as ft
 
+# This column is used to locate the crop image on disk; it isn't shown as a form field.
 IMAGE_LINK_FIELD = "Cropped Box Image Link"
+# These fields tend to hold longer free text, so give them more room to wrap.
 MULTILINE_FIELDS = {"Description", "Review Flags"}
+# VLM-computed metadata shown for context, not meant to be hand-edited.
 READ_ONLY_FIELDS = {"Transcription Confidence (%)", "Review Flags"}
 
 
 def load_rows(csv_path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    """Read catalogue.csv into (header order, row dicts)."""
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         fieldnames = list(reader.fieldnames or [])
@@ -21,6 +25,7 @@ def load_rows(csv_path: Path) -> tuple[list[str], list[dict[str, str]]]:
 
 
 def save_rows(csv_path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    """Rewrite catalogue.csv in full, preserving the original column order."""
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -28,6 +33,7 @@ def save_rows(csv_path: Path, fieldnames: list[str], rows: list[dict[str, str]])
 
 
 def build_page_main(outputs_dir: Path, csv_path: Path):
+    """Load the catalogue once and return a Flet page entry point closed over it."""
     fieldnames, rows = load_rows(csv_path)
     form_fields = [name for name in fieldnames if name != IMAGE_LINK_FIELD]
 
@@ -37,8 +43,11 @@ def build_page_main(outputs_dir: Path, csv_path: Path):
         page.window.height = 800
         page.padding = 20
 
+        # Index of the row currently shown; rows are re-saved to disk on every
+        # Save & Next / Discard box, so progress survives an early exit.
         current_index = 0
 
+        # One TextField per CSV column (excluding the image link), keyed by column name.
         text_fields = {
             name: ft.TextField(
                 label=name,
@@ -50,6 +59,8 @@ def build_page_main(outputs_dir: Path, csv_path: Path):
             for name in form_fields
         }
 
+        # Swapped out on each refresh: an InteractiveViewer-wrapped Image when a
+        # crop is available, or a plain placeholder text when it isn't.
         no_image_placeholder = ft.Text("No image", color=ft.Colors.ON_SURFACE_VARIANT)
         image_area = ft.Container(content=no_image_placeholder, expand=1)
 
@@ -79,6 +90,8 @@ def build_page_main(outputs_dir: Path, csv_path: Path):
             save_next_btn.disabled = not enabled
 
         def refresh(update: bool = True) -> None:
+            """Repaint the form/image/status for current_index, or show the
+            "all done" state once every row has been reviewed."""
             if current_index >= len(rows):
                 status_text.value = "All records reviewed — nothing left to check."
                 for tf in text_fields.values():
@@ -93,9 +106,12 @@ def build_page_main(outputs_dir: Path, csv_path: Path):
             for name in form_fields:
                 text_fields[name].value = row.get(name, "")
 
+            # Image paths in the CSV are relative to the outputs directory.
             image_rel = row.get(IMAGE_LINK_FIELD, "")
             image_path = outputs_dir / image_rel if image_rel else None
             if image_path and image_path.is_file():
+                # Read bytes directly rather than pointing Image at the path: the
+                # outputs dir is arbitrary and outside Flet's assets_dir.
                 image_area.content = ft.InteractiveViewer(
                     content=ft.Image(
                         src=image_path.read_bytes(),
@@ -105,6 +121,7 @@ def build_page_main(outputs_dir: Path, csv_path: Path):
                     ),
                     min_scale=1,
                     max_scale=8,
+                    # Lets trackpad scrolling zoom, not just pan, matching mouse-wheel zoom.
                     trackpad_scroll_causes_scale=True,
                 )
             else:
@@ -116,12 +133,14 @@ def build_page_main(outputs_dir: Path, csv_path: Path):
                 page.update()
 
         def on_discard_box(e: ft.Event) -> None:
+            # This crop wasn't a real record: drop the row entirely and move on.
             nonlocal current_index
             del rows[current_index]
             save_rows(csv_path, fieldnames, rows)
             refresh()
 
         def on_discard_changes(e: ft.Event) -> None:
+            # Reload the row's saved values, discarding any unsaved edits.
             refresh()
 
         def on_save_next(e: ft.Event) -> None:
@@ -137,6 +156,7 @@ def build_page_main(outputs_dir: Path, csv_path: Path):
         discard_changes_btn.on_click = on_discard_changes
         save_next_btn.on_click = on_save_next
 
+        # Left: editable fields. Right: the crop image.
         body = ft.Row(
             controls=[
                 ft.Column(
@@ -165,6 +185,7 @@ def build_page_main(outputs_dir: Path, csv_path: Path):
             )
         )
 
+        # Populate the first row now that everything is on the page.
         refresh()
 
     return page_main
