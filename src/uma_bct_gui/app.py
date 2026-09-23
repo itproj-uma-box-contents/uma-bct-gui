@@ -9,6 +9,7 @@ import flet as ft
 
 IMAGE_LINK_FIELD = "Cropped Box Image Link"
 MULTILINE_FIELDS = {"Description", "Review Flags"}
+READ_ONLY_FIELDS = {"Transcription Confidence (%)", "Review Flags"}
 
 
 def load_rows(csv_path: Path) -> tuple[list[str], list[dict[str, str]]]:
@@ -44,6 +45,7 @@ def build_page_main(outputs_dir: Path, csv_path: Path):
                 multiline=name in MULTILINE_FIELDS,
                 min_lines=3 if name in MULTILINE_FIELDS else 1,
                 max_lines=6 if name in MULTILINE_FIELDS else 1,
+                read_only=name in READ_ONLY_FIELDS,
             )
             for name in form_fields
         }
@@ -94,11 +96,16 @@ def build_page_main(outputs_dir: Path, csv_path: Path):
             image_rel = row.get(IMAGE_LINK_FIELD, "")
             image_path = outputs_dir / image_rel if image_rel else None
             if image_path and image_path.is_file():
-                image_area.content = ft.Image(
-                    src=image_path.read_bytes(),
-                    fit=ft.BoxFit.CONTAIN,
-                    expand=True,
-                    error_content=no_image_placeholder,
+                image_area.content = ft.InteractiveViewer(
+                    content=ft.Image(
+                        src=image_path.read_bytes(),
+                        fit=ft.BoxFit.CONTAIN,
+                        expand=True,
+                        error_content=no_image_placeholder,
+                    ),
+                    min_scale=1,
+                    max_scale=8,
+                    trackpad_scroll_causes_scale=True,
                 )
             else:
                 image_area.content = no_image_placeholder
@@ -146,7 +153,7 @@ def build_page_main(outputs_dir: Path, csv_path: Path):
 
         buttons_row = ft.Row(
             controls=[discard_box_btn, discard_changes_btn, save_next_btn],
-            alignment=ft.MainAxisAlignment.END,
+            alignment=ft.MainAxisAlignment.START,
             spacing=12,
         )
 
