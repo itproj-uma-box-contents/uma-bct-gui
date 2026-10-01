@@ -34,5 +34,7 @@ uv sync
 > The GUI relies on the supplied directory having the structure that the current CLI produces. Changes in the CLI to the structure of the output directory will require (minor) changes to this GUI.
 
 ```
-uv run uma-bct-gui [path/to/CLI/outputs]
+uv run uma-bct-gui
 ```
+
+The GUI opens with nothing loaded. Use the "Open outputs folder" button to pick a CLI outputs directory (one containing `catalogue.csv`) through the OS folder picker.

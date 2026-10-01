@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import argparse
 import csv
-import sys
 from pathlib import Path
 
 import flet as ft
@@ -13,6 +11,10 @@ IMAGE_LINK_FIELD = "Cropped Box Image Link"
 MULTILINE_FIELDS = {"Description", "Review Flags"}
 # VLM-computed metadata shown for context, not meant to be hand-edited.
 READ_ONLY_FIELDS = {"Transcription Confidence (%)", "Review Flags"}
+
+NOTHING_TO_REVIEW = "Nothing to review..."
+# Fixed width of the left-hand form column; the image takes whatever's left.
+FORM_WIDTH = 380
 
 
 def load_rows(csv_path: Path) -> tuple[list[str], list[dict[str, str]]]:
@@ -32,187 +34,229 @@ def save_rows(csv_path: Path, fieldnames: list[str], rows: list[dict[str, str]])
         writer.writerows(rows)
 
 
-def build_page_main(outputs_dir: Path, csv_path: Path):
-    """Load the catalogue once and return a Flet page entry point closed over it."""
-    fieldnames, rows = load_rows(csv_path)
-    form_fields = [name for name in fieldnames if name != IMAGE_LINK_FIELD]
+def page_main(page: ft.Page) -> None:
+    page.title = "UMA BCT Review"
+    page.window.width = 1200
+    page.window.height = 800
+    page.padding = 20
 
-    def page_main(page: ft.Page) -> None:
-        page.title = f"UMA BCT Review — {outputs_dir.name}"
-        page.window.width = 1200
-        page.window.height = 800
-        page.padding = 20
+    # Review state. Nothing is loaded until the user picks a folder, so all of
+    # this starts empty and is (re)populated by load_folder().
+    outputs_dir: Path | None = None
+    csv_path: Path | None = None
+    fieldnames: list[str] = []
+    rows: list[dict[str, str]] = []
+    form_fields: list[str] = []
+    current_index = 0
+    text_fields: dict[str, ft.TextField] = {}
 
-        # Index of the row currently shown; rows are re-saved to disk on every
-        # Save & Next / Discard box, so progress survives an early exit.
+    file_picker = ft.FilePicker()
+
+    empty_message = ft.Text(NOTHING_TO_REVIEW, size=18, weight=ft.FontWeight.BOLD)
+    empty_state = ft.Column(
+        controls=[empty_message],
+        alignment=ft.MainAxisAlignment.CENTER,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        expand=True,
+    )
+
+    # Populated by load_folder() with one TextField per catalogue column. Fixed
+    # width rather than expand=1, so it sizes to its fields and leaves the rest
+    # of the row to the image.
+    form_column = ft.Column(
+        width=FORM_WIDTH,
+        spacing=12,
+        scroll=ft.ScrollMode.AUTO,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+    )
+
+    no_image_placeholder = ft.Text("No image", color=ft.Colors.ON_SURFACE_VARIANT)
+    image_area = ft.Container(content=no_image_placeholder, expand=1)
+
+    status_text = ft.Text(size=16, weight=ft.FontWeight.BOLD)
+
+    open_folder_btn = ft.Button(content="Open outputs folder")
+
+    discard_box_btn = ft.Button(
+        content="Discard box",
+        bgcolor=ft.Colors.RED_400,
+        color=ft.Colors.WHITE,
+    )
+    discard_changes_btn = ft.Button(
+        content="Discard changes",
+        bgcolor=ft.Colors.YELLOW_700,
+        color=ft.Colors.BLACK,
+    )
+    save_next_btn = ft.Button(
+        content="Save & Next",
+        bgcolor=ft.Colors.BLUE_400,
+        color=ft.Colors.WHITE,
+    )
+
+    def set_controls_enabled(enabled: bool) -> None:
+        for tf in text_fields.values():
+            tf.disabled = not enabled
+        discard_box_btn.disabled = not enabled
+        discard_changes_btn.disabled = not enabled
+        save_next_btn.disabled = not enabled
+
+    def refresh(update: bool = True) -> None:
+        """Repaint the form/image/status for current_index, or report that
+        there's nothing left to review once every row has been handled."""
+        if current_index >= len(rows):
+            status_text.value = "No records left to review."
+            for tf in text_fields.values():
+                tf.value = ""
+            image_area.content = no_image_placeholder
+            set_controls_enabled(False)
+            if update:
+                page.update()
+            return
+
+        row = rows[current_index]
+        for name in form_fields:
+            text_fields[name].value = row.get(name, "")
+
+        # Image paths in the CSV are relative to the outputs directory.
+        image_rel = row.get(IMAGE_LINK_FIELD, "")
+        image_path = outputs_dir / image_rel if outputs_dir and image_rel else None
+        if image_path and image_path.is_file():
+            # Read bytes directly rather than pointing Image at the path: the
+            # outputs dir is arbitrary and outside Flet's assets_dir.
+            image_area.content = ft.InteractiveViewer(
+                content=ft.Image(
+                    src=image_path.read_bytes(),
+                    fit=ft.BoxFit.CONTAIN,
+                    expand=True,
+                    error_content=no_image_placeholder,
+                ),
+                min_scale=1,
+                max_scale=8,
+                # Lets trackpad scrolling zoom, not just pan, matching mouse-wheel zoom.
+                trackpad_scroll_causes_scale=True,
+            )
+        else:
+            image_area.content = no_image_placeholder
+
+        status_text.value = f"Record {current_index + 1} of {len(rows)}"
+        set_controls_enabled(True)
+        if update:
+            page.update()
+
+    def show_empty_state(message: str) -> None:
+        nonlocal outputs_dir, csv_path
+        outputs_dir = None
+        csv_path = None
+        page.title = "UMA BCT Review"
+        empty_message.value = message
+        content_area.content = empty_state
+        buttons_row.visible = False
+        page.update()
+
+    def load_folder(dir_path: Path) -> None:
+        nonlocal outputs_dir, csv_path, fieldnames, rows, form_fields, current_index
+
+        candidate_csv = dir_path / "catalogue.csv"
+        if not candidate_csv.is_file():
+            show_empty_state(f"No catalogue.csv found in {dir_path}")
+            return
+
+        outputs_dir = dir_path
+        csv_path = candidate_csv
+        fieldnames, rows = load_rows(csv_path)
+        form_fields = [name for name in fieldnames if name != IMAGE_LINK_FIELD]
         current_index = 0
 
-        # One TextField per CSV column (excluding the image link), keyed by column name.
-        text_fields = {
-            name: ft.TextField(
+        # Rebuild the field inputs from scratch: a different folder's catalogue
+        # could have different columns.
+        text_fields.clear()
+        for name in form_fields:
+            text_fields[name] = ft.TextField(
                 label=name,
                 multiline=name in MULTILINE_FIELDS,
                 min_lines=3 if name in MULTILINE_FIELDS else 1,
                 max_lines=6 if name in MULTILINE_FIELDS else 1,
                 read_only=name in READ_ONLY_FIELDS,
             )
-            for name in form_fields
-        }
+        form_column.controls = list(text_fields.values())
 
-        # Swapped out on each refresh: an InteractiveViewer-wrapped Image when a
-        # crop is available, or a plain placeholder text when it isn't.
-        no_image_placeholder = ft.Text("No image", color=ft.Colors.ON_SURFACE_VARIANT)
-        image_area = ft.Container(content=no_image_placeholder, expand=1)
-
-        status_text = ft.Text(size=16, weight=ft.FontWeight.BOLD)
-
-        discard_box_btn = ft.Button(
-            content="Discard box",
-            bgcolor=ft.Colors.RED_400,
-            color=ft.Colors.WHITE,
-        )
-        discard_changes_btn = ft.Button(
-            content="Discard changes",
-            bgcolor=ft.Colors.YELLOW_700,
-            color=ft.Colors.BLACK,
-        )
-        save_next_btn = ft.Button(
-            content="Save & Next",
-            bgcolor=ft.Colors.BLUE_400,
-            color=ft.Colors.WHITE,
-        )
-
-        def set_controls_enabled(enabled: bool) -> None:
-            for tf in text_fields.values():
-                tf.disabled = not enabled
-            discard_box_btn.disabled = not enabled
-            discard_changes_btn.disabled = not enabled
-            save_next_btn.disabled = not enabled
-
-        def refresh(update: bool = True) -> None:
-            """Repaint the form/image/status for current_index, or show the
-            "all done" state once every row has been reviewed."""
-            if current_index >= len(rows):
-                status_text.value = "All records reviewed — nothing left to check."
-                for tf in text_fields.values():
-                    tf.value = ""
-                image_area.content = no_image_placeholder
-                set_controls_enabled(False)
-                if update:
-                    page.update()
-                return
-
-            row = rows[current_index]
-            for name in form_fields:
-                text_fields[name].value = row.get(name, "")
-
-            # Image paths in the CSV are relative to the outputs directory.
-            image_rel = row.get(IMAGE_LINK_FIELD, "")
-            image_path = outputs_dir / image_rel if image_rel else None
-            if image_path and image_path.is_file():
-                # Read bytes directly rather than pointing Image at the path: the
-                # outputs dir is arbitrary and outside Flet's assets_dir.
-                image_area.content = ft.InteractiveViewer(
-                    content=ft.Image(
-                        src=image_path.read_bytes(),
-                        fit=ft.BoxFit.CONTAIN,
-                        expand=True,
-                        error_content=no_image_placeholder,
-                    ),
-                    min_scale=1,
-                    max_scale=8,
-                    # Lets trackpad scrolling zoom, not just pan, matching mouse-wheel zoom.
-                    trackpad_scroll_causes_scale=True,
-                )
-            else:
-                image_area.content = no_image_placeholder
-
-            status_text.value = f"Record {current_index + 1} of {len(rows)}"
-            set_controls_enabled(True)
-            if update:
-                page.update()
-
-        def on_discard_box(e: ft.Event) -> None:
-            # This crop wasn't a real record: drop the row entirely and move on.
-            nonlocal current_index
-            del rows[current_index]
-            save_rows(csv_path, fieldnames, rows)
-            refresh()
-
-        def on_discard_changes(e: ft.Event) -> None:
-            # Reload the row's saved values, discarding any unsaved edits.
-            refresh()
-
-        def on_save_next(e: ft.Event) -> None:
-            nonlocal current_index
-            row = rows[current_index]
-            for name in form_fields:
-                row[name] = text_fields[name].value or ""
-            save_rows(csv_path, fieldnames, rows)
-            current_index += 1
-            refresh()
-
-        discard_box_btn.on_click = on_discard_box
-        discard_changes_btn.on_click = on_discard_changes
-        save_next_btn.on_click = on_save_next
-
-        # Left: editable fields. Right: the crop image.
-        body = ft.Row(
-            controls=[
-                ft.Column(
-                    controls=list(text_fields.values()),
-                    spacing=12,
-                    scroll=ft.ScrollMode.AUTO,
-                    expand=1,
-                ),
-                image_area,
-            ],
-            expand=True,
-            spacing=24,
-        )
-
-        buttons_row = ft.Row(
-            controls=[discard_box_btn, discard_changes_btn, save_next_btn],
-            alignment=ft.MainAxisAlignment.START,
-            spacing=12,
-        )
-
-        page.add(
-            ft.Column(
-                controls=[status_text, body, buttons_row],
-                expand=True,
-                spacing=16,
-            )
-        )
-
-        # Populate the first row now that everything is on the page.
+        page.title = f"UMA BCT Review — {outputs_dir.name}"
+        content_area.content = body
+        buttons_row.visible = True
         refresh()
 
-    return page_main
+    async def on_open_folder(e: ft.Event) -> None:
+        try:
+            selected = await file_picker.get_directory_path(
+                dialog_title="Select outputs folder"
+            )
+        except Exception as ex:
+            show_empty_state(f"Couldn't open the folder picker: {ex}")
+            return
+        if selected:
+            load_folder(Path(selected))
 
+    def on_discard_box(e: ft.Event) -> None:
+        # This crop wasn't a real record: drop the row entirely and move on.
+        nonlocal current_index
+        del rows[current_index]
+        save_rows(csv_path, fieldnames, rows)
+        refresh()
 
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(
-        prog="uma-bct-gui",
-        description=(
-            "Manually verify VLM-transcribed UMA box catalogue records "
-            "against their cropped box images."
-        ),
+    def on_discard_changes(e: ft.Event) -> None:
+        # Reload the row's saved values, discarding any unsaved edits.
+        refresh()
+
+    def on_save_next(e: ft.Event) -> None:
+        nonlocal current_index
+        row = rows[current_index]
+        for name in form_fields:
+            row[name] = text_fields[name].value or ""
+        save_rows(csv_path, fieldnames, rows)
+        current_index += 1
+        refresh()
+
+    open_folder_btn.on_click = on_open_folder
+    discard_box_btn.on_click = on_discard_box
+    discard_changes_btn.on_click = on_discard_changes
+    save_next_btn.on_click = on_save_next
+
+    # Left: editable fields. Right: the crop image.
+    body = ft.Row(
+        controls=[form_column, image_area],
+        expand=True,
+        spacing=24,
     )
-    parser.add_argument(
-        "outputs_dir",
-        type=Path,
-        help="Path to an outputs directory containing catalogue.csv",
+
+    top_bar = ft.Row(
+        controls=[open_folder_btn, status_text],
+        spacing=16,
     )
-    args = parser.parse_args(argv)
 
-    outputs_dir: Path = args.outputs_dir.expanduser().resolve()
-    csv_path = outputs_dir / "catalogue.csv"
-    if not csv_path.is_file():
-        print(f"error: no catalogue.csv found in {outputs_dir}", file=sys.stderr)
-        sys.exit(1)
+    buttons_row = ft.Row(
+        controls=[discard_box_btn, discard_changes_btn, save_next_btn],
+        alignment=ft.MainAxisAlignment.START,
+        spacing=12,
+        visible=False,
+    )
 
-    ft.run(build_page_main(outputs_dir, csv_path))
+    # Swapped between empty_state and body as folders are opened.
+    content_area = ft.Container(content=empty_state, expand=True)
+
+    page.add(
+        ft.Column(
+            controls=[top_bar, content_area, buttons_row],
+            expand=True,
+            spacing=16,
+            # Without this, children only take their natural width and the
+            # centered empty-state message ends up hugging the left edge.
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        )
+    )
+
+
+def main() -> None:
+    ft.run(page_main)
 
 
 if __name__ == "__main__":
