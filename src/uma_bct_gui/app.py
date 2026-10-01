@@ -133,6 +133,11 @@ def page_main(page: ft.Page) -> None:
         bgcolor=ft.Colors.YELLOW,
         color=ft.Colors.BLACK,
     )
+    back_btn = ft.Button(
+        content="Back",
+        bgcolor=ft.Colors.GREY,
+        color=ft.Colors.BLACK,
+    )
     save_next_btn = ft.Button(
         content="Save & Next",
         bgcolor=ft.Colors.BLUE,
@@ -157,6 +162,8 @@ def page_main(page: ft.Page) -> None:
             flags_column.controls = []
             image_area.content = no_image_placeholder
             set_controls_enabled(False)
+            # Still let the user step back to revisit an already-reviewed record.
+            back_btn.disabled = current_index <= 0
             if update:
                 page.update()
             return
@@ -189,6 +196,7 @@ def page_main(page: ft.Page) -> None:
 
         status_text.value = f"Record {current_index + 1} of {len(rows)}"
         set_controls_enabled(True)
+        back_btn.disabled = current_index <= 0
         if update:
             page.update()
 
@@ -256,6 +264,13 @@ def page_main(page: ft.Page) -> None:
         # Reload the row's saved values, discarding any unsaved edits.
         refresh()
 
+    def on_back(e: ft.Event) -> None:
+        # Revisit the previous record; unsaved edits on the current one are dropped.
+        nonlocal current_index
+        if current_index > 0:
+            current_index -= 1
+            refresh()
+
     def on_save_next(e: ft.Event) -> None:
         nonlocal current_index
         row = rows[current_index]
@@ -269,6 +284,7 @@ def page_main(page: ft.Page) -> None:
     open_folder_btn.on_click = on_open_folder
     discard_box_btn.on_click = on_discard_box
     discard_changes_btn.on_click = on_discard_changes
+    back_btn.on_click = on_back
     save_next_btn.on_click = on_save_next
 
     # Left: editable fields. Right: the crop image.
@@ -284,7 +300,7 @@ def page_main(page: ft.Page) -> None:
     )
 
     buttons_row = ft.Row(
-        controls=[discard_box_btn, discard_changes_btn, save_next_btn],
+        controls=[discard_box_btn, discard_changes_btn, back_btn, save_next_btn],
         alignment=ft.MainAxisAlignment.START,
         spacing=12,
         visible=False,
