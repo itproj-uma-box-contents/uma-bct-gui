@@ -7,10 +7,16 @@ import flet as ft
 
 # This column is used to locate the crop image on disk; it isn't shown as a form field.
 IMAGE_LINK_FIELD = "Cropped Box Image Link"
+# Flags get their own add/remove-a-row UI instead of a generic TextField.
+FLAGS_FIELD = "Review Flags"
+# Columns handled by dedicated UI rather than the generic text-field loop.
+CUSTOM_FIELDS = {IMAGE_LINK_FIELD, FLAGS_FIELD}
 # These fields tend to hold longer free text, so give them more room to wrap.
-MULTILINE_FIELDS = {"Description", "Review Flags"}
+MULTILINE_FIELDS = {"Description"}
 # VLM-computed metadata shown for context, not meant to be hand-edited.
-READ_ONLY_FIELDS = {"Transcription Confidence (%)", "Review Flags"}
+READ_ONLY_FIELDS = {"Transcription Confidence (%)"}
+# Separator used to pack the flags list into the CSV's single text column.
+FLAGS_SEPARATOR = "; "
 
 NOTHING_TO_REVIEW = "Nothing to review..."
 # Fixed width of the left-hand form column; the image takes whatever's left.
@@ -70,6 +76,46 @@ def page_main(page: ft.Page) -> None:
         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
     )
 
+    # One row per flag: a TextField plus a remove button. Rebuilt on every
+    # refresh() from the current row's semicolon-separated flags text.
+    flags_column = ft.Column(spacing=6)
+
+    def make_flag_row(value: str = "") -> ft.Row:
+        field = ft.TextField(value=value, dense=True, expand=True)
+        remove_btn = ft.IconButton(icon=ft.Icons.CLOSE, icon_size=18, tooltip="Remove flag")
+        row = ft.Row(controls=[field, remove_btn], spacing=4)
+        row.data = field  # lets callers read this row's text back out later
+
+        def on_remove(e: ft.Event) -> None:
+            flags_column.controls.remove(row)
+            page.update()
+
+        remove_btn.on_click = on_remove
+        return row
+
+    def on_add_flag(e: ft.Event) -> None:
+        flags_column.controls.append(make_flag_row())
+        page.update()
+
+    add_flag_btn = ft.TextButton(content="+ Add flag", on_click=on_add_flag)
+
+    def set_flags(value: str) -> None:
+        parts = [p.strip() for p in value.split(";")] if value else []
+        flags_column.controls = [make_flag_row(p) for p in parts if p]
+
+    def get_flags_text() -> str:
+        values = [row.data.value.strip() for row in flags_column.controls]
+        return FLAGS_SEPARATOR.join(v for v in values if v)
+
+    flags_block = ft.Column(
+        controls=[
+            ft.Text("Review Flags", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+            flags_column,
+            add_flag_btn,
+        ],
+        spacing=6,
+    )
+
     no_image_placeholder = ft.Text("No image", color=ft.Colors.ON_SURFACE_VARIANT)
     image_area = ft.Container(content=no_image_placeholder, expand=1)
 
@@ -96,6 +142,7 @@ def page_main(page: ft.Page) -> None:
     def set_controls_enabled(enabled: bool) -> None:
         for tf in text_fields.values():
             tf.disabled = not enabled
+        add_flag_btn.disabled = not enabled
         discard_box_btn.disabled = not enabled
         discard_changes_btn.disabled = not enabled
         save_next_btn.disabled = not enabled
@@ -107,6 +154,7 @@ def page_main(page: ft.Page) -> None:
             status_text.value = "No records left to review."
             for tf in text_fields.values():
                 tf.value = ""
+            flags_column.controls = []
             image_area.content = no_image_placeholder
             set_controls_enabled(False)
             if update:
@@ -116,6 +164,7 @@ def page_main(page: ft.Page) -> None:
         row = rows[current_index]
         for name in form_fields:
             text_fields[name].value = row.get(name, "")
+        set_flags(row.get(FLAGS_FIELD, ""))
 
         # Image paths in the CSV are relative to the outputs directory.
         image_rel = row.get(IMAGE_LINK_FIELD, "")
@@ -164,7 +213,7 @@ def page_main(page: ft.Page) -> None:
         outputs_dir = dir_path
         csv_path = candidate_csv
         fieldnames, rows = load_rows(csv_path)
-        form_fields = [name for name in fieldnames if name != IMAGE_LINK_FIELD]
+        form_fields = [name for name in fieldnames if name not in CUSTOM_FIELDS]
         current_index = 0
 
         # Rebuild the field inputs from scratch: a different folder's catalogue
@@ -178,7 +227,7 @@ def page_main(page: ft.Page) -> None:
                 max_lines=6 if name in MULTILINE_FIELDS else 1,
                 read_only=name in READ_ONLY_FIELDS,
             )
-        form_column.controls = list(text_fields.values())
+        form_column.controls = [*text_fields.values(), flags_block]
 
         page.title = f"UMA BCT Review — {outputs_dir.name}"
         content_area.content = body
@@ -212,6 +261,7 @@ def page_main(page: ft.Page) -> None:
         row = rows[current_index]
         for name in form_fields:
             row[name] = text_fields[name].value or ""
+        row[FLAGS_FIELD] = get_flags_text()
         save_rows(csv_path, fieldnames, rows)
         current_index += 1
         refresh()
