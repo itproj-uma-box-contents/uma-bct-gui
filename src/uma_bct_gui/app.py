@@ -125,17 +125,17 @@ def page_main(page: ft.Page) -> None:
 
     discard_box_btn = ft.Button(
         content="Discard box",
-        bgcolor=ft.Colors.RED_400,
+        bgcolor=ft.Colors.RED,
         color=ft.Colors.WHITE,
     )
     discard_changes_btn = ft.Button(
         content="Discard changes",
-        bgcolor=ft.Colors.YELLOW_700,
+        bgcolor=ft.Colors.YELLOW,
         color=ft.Colors.BLACK,
     )
     save_next_btn = ft.Button(
         content="Save & Next",
-        bgcolor=ft.Colors.BLUE_400,
+        bgcolor=ft.Colors.BLUE,
         color=ft.Colors.WHITE,
     )
 
