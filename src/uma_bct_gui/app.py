@@ -65,7 +65,6 @@ FLAG_COLORS: dict[str, tuple[str, str]] = {
 # an older run) — still shown and removable, just not offered when adding.
 DEFAULT_FLAG_COLOR = (ft.Colors.GREY_400, ft.Colors.BLACK)
 
-NOTHING_TO_REVIEW = "Nothing to review..."
 # Fixed width of the left-hand form column; the image takes whatever's left.
 FORM_WIDTH = 380
 
@@ -105,7 +104,10 @@ def page_main(page: ft.Page) -> None:
 
     file_picker = ft.FilePicker()
 
-    empty_message = ft.Text(NOTHING_TO_REVIEW, size=18, weight=ft.FontWeight.BOLD)
+    # Only used to report a folder-selection error; the "nothing to review"
+    # state (no folder open yet, or every row already reviewed) reuses the
+    # normal body view instead — see refresh()'s current_index >= len(rows) branch.
+    empty_message = ft.Text(size=18, weight=ft.FontWeight.BOLD)
     empty_state = ft.Column(
         controls=[empty_message],
         alignment=ft.MainAxisAlignment.CENTER,
@@ -235,10 +237,11 @@ def page_main(page: ft.Page) -> None:
         return None
 
     def refresh(update: bool = True) -> None:
-        """Repaint the form/image/status for current_index, or report that
-        there's nothing left to review once every row has been handled."""
+        """Repaint the form/image/status for current_index, or show the same
+        "nothing to review" state whether no folder is open yet (0 of 0) or
+        every row in it has been reviewed (0 of however many there are)."""
         if current_index >= len(rows):
-            status_text.value = "No records left to review."
+            status_text.value = f"Record 0 of {len(rows)}"
             for tf in text_fields.values():
                 tf.value = ""
             flags_row.controls = []
@@ -394,11 +397,11 @@ def page_main(page: ft.Page) -> None:
         controls=[discard_box_btn, discard_changes_btn, back_btn, save_next_btn],
         alignment=ft.MainAxisAlignment.START,
         spacing=12,
-        visible=False,
     )
 
-    # Swapped between empty_state and body as folders are opened.
-    content_area = ft.Container(content=empty_state, expand=True)
+    # Normally shows body (refresh() renders its own "nothing to review" state
+    # there when needed); swapped to empty_state only for a folder-selection error.
+    content_area = ft.Container(content=body, expand=True)
 
     page.add(
         ft.Column(
@@ -410,6 +413,8 @@ def page_main(page: ft.Page) -> None:
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         )
     )
+
+    refresh()
 
 
 def main() -> None:
