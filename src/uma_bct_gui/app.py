@@ -192,17 +192,17 @@ def page_main(page: ft.Page) -> None:
     open_folder_btn = ft.Button(content="Open outputs folder")
 
     discard_box_btn = ft.Button(
-        content="Discard box",
+        content="Discard Box",
         bgcolor=ft.Colors.RED,
         color=ft.Colors.WHITE,
     )
     discard_changes_btn = ft.Button(
-        content="Discard changes",
+        content="Discard Changes",
         bgcolor=ft.Colors.YELLOW,
         color=ft.Colors.BLACK,
     )
     back_btn = ft.Button(
-        content="Back",
+        content="Back (Discard Changes)",
         bgcolor=ft.Colors.GREY,
         color=ft.Colors.BLACK,
     )
