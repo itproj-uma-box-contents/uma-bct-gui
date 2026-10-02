@@ -9,14 +9,19 @@ import flet as ft
 IMAGE_LINK_FIELD = "Cropped Box Image Link"
 # Flags get their own add/remove chip UI instead of a generic TextField.
 FLAGS_FIELD = "Review Flags"
+# Reviewed state is a Checkbox, not a TextField.
+REVIEWED_FIELD = "Reviewed"
 # Columns handled by dedicated UI rather than the generic text-field loop.
-CUSTOM_FIELDS = {IMAGE_LINK_FIELD, FLAGS_FIELD}
+CUSTOM_FIELDS = {IMAGE_LINK_FIELD, FLAGS_FIELD, REVIEWED_FIELD}
 # These fields tend to hold longer free text, so give them more room to wrap.
 MULTILINE_FIELDS = {"Description"}
 # VLM-computed metadata shown for context, not meant to be hand-edited.
 READ_ONLY_FIELDS = {"Transcription Confidence (%)"}
 # Separator used to pack the flags list into the CSV's single text column.
 FLAGS_SEPARATOR = "; "
+# CSV stores this as the literal strings "True"/"False", not real booleans.
+REVIEWED_TRUE = "True"
+REVIEWED_FALSE = "False"
 
 DUPLICATE_FLAG = "Potential Duplicate"
 MISSING_BOX_FLAG = "Missing Box"
@@ -177,6 +182,8 @@ def page_main(page: ft.Page) -> None:
         spacing=6,
     )
 
+    reviewed_checkbox = ft.Checkbox(label="Mark as reviewed")
+
     no_image_placeholder = ft.Text("No image", color=ft.Colors.ON_SURFACE_VARIANT)
     image_area = ft.Container(content=no_image_placeholder, expand=1)
 
@@ -208,6 +215,7 @@ def page_main(page: ft.Page) -> None:
     def set_controls_enabled(enabled: bool) -> None:
         for tf in text_fields.values():
             tf.disabled = not enabled
+        reviewed_checkbox.disabled = not enabled
         if not enabled:
             # When enabling, availability is governed by refresh_add_flag_menu()
             # instead (disabled once every flag has already been applied).
@@ -224,6 +232,7 @@ def page_main(page: ft.Page) -> None:
             for tf in text_fields.values():
                 tf.value = ""
             flags_row.controls = []
+            reviewed_checkbox.value = False
             image_area.content = no_image_placeholder
             set_controls_enabled(False)
             # Still let the user step back to revisit an already-reviewed record.
@@ -236,6 +245,7 @@ def page_main(page: ft.Page) -> None:
         for name in form_fields:
             text_fields[name].value = row.get(name, "")
         set_flags(row.get(FLAGS_FIELD, ""))
+        reviewed_checkbox.value = row.get(REVIEWED_FIELD, REVIEWED_FALSE) == REVIEWED_TRUE
 
         # Image paths in the CSV are relative to the outputs directory.
         image_rel = row.get(IMAGE_LINK_FIELD, "")
@@ -285,6 +295,10 @@ def page_main(page: ft.Page) -> None:
         outputs_dir = dir_path
         csv_path = candidate_csv
         fieldnames, rows = load_rows(csv_path)
+        if REVIEWED_FIELD not in fieldnames:
+            fieldnames.append(REVIEWED_FIELD)
+        for row in rows:
+            row.setdefault(REVIEWED_FIELD, REVIEWED_FALSE)
         form_fields = [name for name in fieldnames if name not in CUSTOM_FIELDS]
         current_index = 0
 
@@ -299,7 +313,7 @@ def page_main(page: ft.Page) -> None:
                 max_lines=6 if name in MULTILINE_FIELDS else 1,
                 read_only=name in READ_ONLY_FIELDS,
             )
-        form_column.controls = [*text_fields.values(), flags_block]
+        form_column.controls = [*text_fields.values(), flags_block, reviewed_checkbox]
 
         page.title = f"UMA BCT Review — {outputs_dir.name}"
         content_area.content = body
@@ -341,6 +355,7 @@ def page_main(page: ft.Page) -> None:
         for name in form_fields:
             row[name] = text_fields[name].value or ""
         row[FLAGS_FIELD] = get_flags_text()
+        row[REVIEWED_FIELD] = REVIEWED_TRUE if reviewed_checkbox.value else REVIEWED_FALSE
         save_rows(csv_path, fieldnames, rows)
         current_index += 1
         refresh()
