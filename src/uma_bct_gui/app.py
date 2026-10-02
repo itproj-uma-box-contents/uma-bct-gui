@@ -14,7 +14,7 @@ REVIEWED_FIELD = "Reviewed"
 # Columns handled by dedicated UI rather than the generic text-field loop.
 CUSTOM_FIELDS = {IMAGE_LINK_FIELD, FLAGS_FIELD, REVIEWED_FIELD}
 # These fields tend to hold longer free text, so give them more room to wrap.
-MULTILINE_FIELDS = {"Description"}
+MULTILINE_FIELDS = {"Description", "Unit Type"}
 # VLM-computed metadata shown for context, not meant to be hand-edited.
 READ_ONLY_FIELDS = {"Transcription Confidence (%)"}
 # Separator used to pack the flags list into the CSV's single text column.
