@@ -12,12 +12,9 @@ It also allows users to zoom in on the image as shown
 
 ![Screenshot of the UMA BCT GUI with zoom engaged](./screenshot-zoomed-in.png)
 
+The following screenshot (of the "Add flag" menu) shows the flags available and the colour-coding used:
 
-## Why is this a separate repository?
-
-The GUI has been separated completely from the CLI because of how the client intends to use the software. Recall that the client has mentioned that the main purpose of the GUI is for speeding up the process of manually reviewing the program's outputs. Due to how long the solution takes to run, it's unlikely that this manual review process will start as soon as transcription finishes. Therefore, it doesn't really make sense for the reviewing component of the solution to run in the same process as the transcription component, or for these two components to share an interface.
-
-I also thought about adding another module into the existing repository rather than creating a brand new one, but due to the very different dependencies of the two parts of the project (this GUI depends only on the `flet` package, which is not needed for the CLI, and the CLI has 7 dependencies, none of which are necessary for this), I think having this as a completely separate repository makes the most sense. The archivists could all have this GUI on their own computers (without having to install the CLI, Ollama, or the Qwen model), and everything else could just run on the workstations that are already set up in the archives.
+![Screenshot of the UMA BCT GUI's "Add flag" menu](./flag-colour-coding.png)
 
 ## Setup
 
