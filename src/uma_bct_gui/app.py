@@ -7,7 +7,7 @@ import flet as ft
 
 # This column is used to locate the crop image on disk; it isn't shown as a form field.
 IMAGE_LINK_FIELD = "Cropped Box Image Link"
-# Flags get their own add/remove-a-row UI instead of a generic TextField.
+# Flags get their own add/remove chip UI instead of a generic TextField.
 FLAGS_FIELD = "Review Flags"
 # Columns handled by dedicated UI rather than the generic text-field loop.
 CUSTOM_FIELDS = {IMAGE_LINK_FIELD, FLAGS_FIELD}
@@ -17,6 +17,48 @@ MULTILINE_FIELDS = {"Description"}
 READ_ONLY_FIELDS = {"Transcription Confidence (%)"}
 # Separator used to pack the flags list into the CSV's single text column.
 FLAGS_SEPARATOR = "; "
+
+DUPLICATE_FLAG = "Potential Duplicate"
+MISSING_BOX_FLAG = "Missing Box"
+LOW_CONFIDENCE_FLAG = "Low confidence"
+MISSING_IDENTIFIER_FLAG = "Missing identifier"
+AMBIGUOUS_IDENTIFIER_FLAG = "Ambiguous identifier"
+MULTIPLE_IDENTIFIERS_FLAG = "Multiple identifiers"
+MISSING_UNIT_FLAG = "Missing unit"
+INVALID_UNIT_FLAG = "Invalid unit"
+TRANSCRIPTION_MISMATCH_FLAG = "Transcription mismatch"
+FALLBACK_USED_FLAG = "Fallback used"
+
+# The only flags choosable from the "+ Add flag" menu, in menu order.
+ALL_FLAGS = [
+    DUPLICATE_FLAG,
+    MISSING_BOX_FLAG,
+    LOW_CONFIDENCE_FLAG,
+    MISSING_IDENTIFIER_FLAG,
+    AMBIGUOUS_IDENTIFIER_FLAG,
+    MULTIPLE_IDENTIFIERS_FLAG,
+    MISSING_UNIT_FLAG,
+    INVALID_UNIT_FLAG,
+    TRANSCRIPTION_MISMATCH_FLAG,
+    FALLBACK_USED_FLAG,
+]
+
+# (chip background, chip text/delete-icon color) per flag.
+FLAG_COLORS: dict[str, tuple[str, str]] = {
+    DUPLICATE_FLAG: (ft.Colors.PURPLE, ft.Colors.WHITE),
+    MISSING_BOX_FLAG: (ft.Colors.RED, ft.Colors.WHITE),
+    LOW_CONFIDENCE_FLAG: (ft.Colors.AMBER, ft.Colors.BLACK),
+    MISSING_IDENTIFIER_FLAG: (ft.Colors.DEEP_ORANGE, ft.Colors.WHITE),
+    AMBIGUOUS_IDENTIFIER_FLAG: (ft.Colors.ORANGE, ft.Colors.BLACK),
+    MULTIPLE_IDENTIFIERS_FLAG: (ft.Colors.PINK, ft.Colors.WHITE),
+    MISSING_UNIT_FLAG: (ft.Colors.BROWN, ft.Colors.WHITE),
+    INVALID_UNIT_FLAG: (ft.Colors.DEEP_PURPLE, ft.Colors.WHITE),
+    TRANSCRIPTION_MISMATCH_FLAG: (ft.Colors.INDIGO, ft.Colors.WHITE),
+    FALLBACK_USED_FLAG: (ft.Colors.BLUE_GREY, ft.Colors.WHITE),
+}
+# Covers any flag already in a catalogue but outside the list above (e.g. from
+# an older run) — still shown and removable, just not offered when adding.
+DEFAULT_FLAG_COLOR = (ft.Colors.GREY_400, ft.Colors.BLACK)
 
 NOTHING_TO_REVIEW = "Nothing to review..."
 # Fixed width of the left-hand form column; the image takes whatever's left.
@@ -76,41 +118,60 @@ def page_main(page: ft.Page) -> None:
         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
     )
 
-    # One row per flag: a TextField plus a remove button. Rebuilt on every
-    # refresh() from the current row's semicolon-separated flags text.
-    flags_column = ft.Column(spacing=6)
+    # One color-coded, delete-able chip per flag. Rebuilt on every refresh()
+    # from the current row's semicolon-separated flags text. wrap=True lets
+    # chips flow onto multiple lines instead of overflowing the fixed-width form.
+    flags_row = ft.Row(wrap=True, spacing=8, run_spacing=8)
 
-    def make_flag_row(value: str = "") -> ft.Row:
-        field = ft.TextField(value=value, dense=True, expand=True)
-        remove_btn = ft.IconButton(icon=ft.Icons.CLOSE, icon_size=18, tooltip="Remove flag")
-        row = ft.Row(controls=[field, remove_btn], spacing=4)
-        row.data = field  # lets callers read this row's text back out later
+    def make_flag_chip(flag: str) -> ft.Chip:
+        bgcolor, text_color = FLAG_COLORS.get(flag, DEFAULT_FLAG_COLOR)
+        chip = ft.Chip(
+            label=ft.Text(flag, color=text_color, size=13),
+            bgcolor=bgcolor,
+            delete_icon_color=text_color,
+        )
+        chip.data = flag
 
-        def on_remove(e: ft.Event) -> None:
-            flags_column.controls.remove(row)
+        def on_delete(e: ft.Event) -> None:
+            flags_row.controls.remove(chip)
+            refresh_add_flag_menu()
             page.update()
 
-        remove_btn.on_click = on_remove
-        return row
+        chip.on_delete = on_delete
+        return chip
 
-    def on_add_flag(e: ft.Event) -> None:
-        flags_column.controls.append(make_flag_row())
-        page.update()
+    def make_add_flag_item(flag: str) -> ft.PopupMenuItem:
+        bgcolor, _ = FLAG_COLORS.get(flag, DEFAULT_FLAG_COLOR)
+        swatch = ft.Container(width=12, height=12, bgcolor=bgcolor, border_radius=3)
 
-    add_flag_btn = ft.TextButton(content="+ Add flag", on_click=on_add_flag)
+        def pick(e: ft.Event) -> None:
+            flags_row.controls.append(make_flag_chip(flag))
+            refresh_add_flag_menu()
+            page.update()
+
+        return ft.PopupMenuItem(content=ft.Row([swatch, ft.Text(flag)], spacing=8), on_click=pick)
+
+    add_flag_btn = ft.PopupMenuButton(content="+ Add flag")
+
+    def refresh_add_flag_menu() -> None:
+        """Offer only flags not already applied to this record."""
+        existing = {chip.data for chip in flags_row.controls}
+        available = [f for f in ALL_FLAGS if f not in existing]
+        add_flag_btn.items = [make_add_flag_item(f) for f in available]
+        add_flag_btn.disabled = not available
 
     def set_flags(value: str) -> None:
         parts = [p.strip() for p in value.split(";")] if value else []
-        flags_column.controls = [make_flag_row(p) for p in parts if p]
+        flags_row.controls = [make_flag_chip(p) for p in parts if p]
+        refresh_add_flag_menu()
 
     def get_flags_text() -> str:
-        values = [row.data.value.strip() for row in flags_column.controls]
-        return FLAGS_SEPARATOR.join(v for v in values if v)
+        return FLAGS_SEPARATOR.join(chip.data for chip in flags_row.controls)
 
     flags_block = ft.Column(
         controls=[
             ft.Text("Review Flags", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
-            flags_column,
+            flags_row,
             add_flag_btn,
         ],
         spacing=6,
@@ -147,7 +208,10 @@ def page_main(page: ft.Page) -> None:
     def set_controls_enabled(enabled: bool) -> None:
         for tf in text_fields.values():
             tf.disabled = not enabled
-        add_flag_btn.disabled = not enabled
+        if not enabled:
+            # When enabling, availability is governed by refresh_add_flag_menu()
+            # instead (disabled once every flag has already been applied).
+            add_flag_btn.disabled = True
         discard_box_btn.disabled = not enabled
         discard_changes_btn.disabled = not enabled
         save_next_btn.disabled = not enabled
@@ -159,7 +223,7 @@ def page_main(page: ft.Page) -> None:
             status_text.value = "No records left to review."
             for tf in text_fields.values():
                 tf.value = ""
-            flags_column.controls = []
+            flags_row.controls = []
             image_area.content = no_image_placeholder
             set_controls_enabled(False)
             # Still let the user step back to revisit an already-reviewed record.
