@@ -224,6 +224,16 @@ def page_main(page: ft.Page) -> None:
         discard_changes_btn.disabled = not enabled
         save_next_btn.disabled = not enabled
 
+    def find_next_unreviewed(after_index: int) -> int | None:
+        """Search forward from after_index, wrapping around, for an unreviewed
+        row. Passing -1 searches the whole list starting from the first row."""
+        n = len(rows)
+        for offset in range(1, n + 1):
+            idx = (after_index + offset) % n
+            if rows[idx].get(REVIEWED_FIELD, REVIEWED_FALSE) != REVIEWED_TRUE:
+                return idx
+        return None
+
     def refresh(update: bool = True) -> None:
         """Repaint the form/image/status for current_index, or report that
         there's nothing left to review once every row has been handled."""
@@ -300,7 +310,8 @@ def page_main(page: ft.Page) -> None:
         for row in rows:
             row.setdefault(REVIEWED_FIELD, REVIEWED_FALSE)
         form_fields = [name for name in fieldnames if name not in CUSTOM_FIELDS]
-        current_index = 0
+        first_unreviewed = find_next_unreviewed(-1)
+        current_index = first_unreviewed if first_unreviewed is not None else len(rows)
 
         # Rebuild the field inputs from scratch: a different folder's catalogue
         # could have different columns.
@@ -357,7 +368,8 @@ def page_main(page: ft.Page) -> None:
         row[FLAGS_FIELD] = get_flags_text()
         row[REVIEWED_FIELD] = REVIEWED_TRUE if reviewed_checkbox.value else REVIEWED_FALSE
         save_rows(csv_path, fieldnames, rows)
-        current_index += 1
+        next_index = find_next_unreviewed(current_index)
+        current_index = next_index if next_index is not None else len(rows)
         refresh()
 
     open_folder_btn.on_click = on_open_folder
