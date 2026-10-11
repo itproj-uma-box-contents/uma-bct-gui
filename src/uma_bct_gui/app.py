@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from collections.abc import Callable
 from pathlib import Path
 
 import flet as ft
@@ -67,6 +68,10 @@ DEFAULT_FLAG_COLOR = (ft.Colors.GREY_400, ft.Colors.BLACK)
 
 # Fixed width of the left-hand form column; the image takes whatever's left.
 FORM_WIDTH = 380
+
+
+def parse_flags(value: str | None) -> list[str]:
+    return [p.strip() for p in (value or "").split(";") if p.strip()]
 
 
 def load_rows(csv_path: Path) -> tuple[list[str], list[dict[str, str]]]:
@@ -168,8 +173,7 @@ def page_main(page: ft.Page) -> None:
         add_flag_btn.disabled = not available
 
     def set_flags(value: str) -> None:
-        parts = [p.strip() for p in value.split(";")] if value else []
-        flags_row.controls = [make_flag_chip(p) for p in parts if p]
+        flags_row.controls = [make_flag_chip(p) for p in parse_flags(value)]
         refresh_add_flag_menu()
 
     def get_flags_text() -> str:
@@ -193,25 +197,30 @@ def page_main(page: ft.Page) -> None:
 
     open_folder_btn = ft.Button(content="Open outputs folder")
 
-    discard_box_btn = ft.Button(
-        content="Discard Box",
-        bgcolor=ft.Colors.RED,
-        color=ft.Colors.WHITE,
-    )
     discard_changes_btn = ft.Button(
-        content="Discard Changes",
-        bgcolor=ft.Colors.YELLOW,
-        color=ft.Colors.BLACK,
-    )
-    back_btn = ft.Button(
-        content="Back (Discard Changes)",
+        content="Discard changes",
         bgcolor=ft.Colors.GREY,
         color=ft.Colors.BLACK,
     )
-    save_next_btn = ft.Button(
-        content="Save & Next",
+    discard_box_btn = ft.Button(
+        content="Discard box",
+        bgcolor=ft.Colors.RED,
+        color=ft.Colors.WHITE,
+    )
+    save_btn = ft.Button(
+        content="Save",
         bgcolor=ft.Colors.BLUE,
         color=ft.Colors.WHITE,
+    )
+    prev_btn = ft.Button(
+        content="Prev",
+        bgcolor=ft.Colors.GREY,
+        color=ft.Colors.BLACK,
+    )
+    next_btn = ft.Button(
+        content="Next",
+        bgcolor=ft.Colors.GREY,
+        color=ft.Colors.BLACK,
     )
 
     def set_controls_enabled(enabled: bool) -> None:
@@ -222,9 +231,30 @@ def page_main(page: ft.Page) -> None:
             # When enabling, availability is governed by refresh_add_flag_menu()
             # instead (disabled once every flag has already been applied).
             add_flag_btn.disabled = True
-        discard_box_btn.disabled = not enabled
         discard_changes_btn.disabled = not enabled
-        save_next_btn.disabled = not enabled
+        discard_box_btn.disabled = not enabled
+        save_btn.disabled = not enabled
+
+    def ask(title: str, message: str, options: list[tuple[str, Callable[[], None] | None]]) -> None:
+        """Show a modal dialog with one button per (label, callback) option; the
+        dialog closes first, then the chosen callback (if any) runs."""
+
+        def make_handler(callback: Callable[[], None] | None):
+            def handler(e: ft.Event) -> None:
+                page.pop_dialog()
+                if callback:
+                    callback()
+
+            return handler
+
+        page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text(title),
+                content=ft.Text(message),
+                actions=[ft.TextButton(label, on_click=make_handler(cb)) for label, cb in options],
+            )
+        )
 
     def find_next_unreviewed(after_index: int) -> int | None:
         """Search forward from after_index, wrapping around, for an unreviewed
@@ -240,6 +270,10 @@ def page_main(page: ft.Page) -> None:
         """Repaint the form/image/status for current_index, or show the same
         "nothing to review" state whether no folder is open yet (0 of 0) or
         every row in it has been reviewed (0 of however many there are)."""
+        # In the "nothing to review" state current_index == len(rows), so Prev
+        # still lets the user step back into the last record.
+        prev_btn.disabled = current_index <= 0
+        next_btn.disabled = current_index >= len(rows) - 1
         if current_index >= len(rows):
             status_text.value = f"Record 0 of {len(rows)}"
             for tf in text_fields.values():
@@ -248,8 +282,6 @@ def page_main(page: ft.Page) -> None:
             reviewed_checkbox.value = False
             image_area.content = no_image_placeholder
             set_controls_enabled(False)
-            # Still let the user step back to revisit an already-reviewed record.
-            back_btn.disabled = current_index <= 0
             if update:
                 page.update()
             return
@@ -283,7 +315,6 @@ def page_main(page: ft.Page) -> None:
 
         status_text.value = f"Record {current_index + 1} of {len(rows)}"
         set_controls_enabled(True)
-        back_btn.disabled = current_index <= 0
         if update:
             page.update()
 
@@ -345,41 +376,80 @@ def page_main(page: ft.Page) -> None:
         if selected:
             load_folder(Path(selected))
 
-    def on_discard_box(e: ft.Event) -> None:
-        # This crop wasn't a real record: drop the row entirely and move on.
-        nonlocal current_index
-        del rows[current_index]
-        save_rows(csv_path, fieldnames, rows)
-        refresh()
+    def has_unsaved_changes() -> bool:
+        if current_index >= len(rows):
+            return False
+        row = rows[current_index]
+        if any((row.get(name) or "") != (text_fields[name].value or "") for name in form_fields):
+            return True
+        if get_flags_text() != FLAGS_SEPARATOR.join(parse_flags(row.get(FLAGS_FIELD))):
+            return True
+        saved_reviewed = row.get(REVIEWED_FIELD, REVIEWED_FALSE) == REVIEWED_TRUE
+        return bool(reviewed_checkbox.value) != saved_reviewed
 
-    def on_discard_changes(e: ft.Event) -> None:
-        # Reload the row's saved values, discarding any unsaved edits.
-        refresh()
-
-    def on_back(e: ft.Event) -> None:
-        # Revisit the previous record; unsaved edits on the current one are dropped.
-        nonlocal current_index
-        if current_index > 0:
-            current_index -= 1
-            refresh()
-
-    def on_save_next(e: ft.Event) -> None:
-        nonlocal current_index
+    def save_current() -> None:
         row = rows[current_index]
         for name in form_fields:
             row[name] = text_fields[name].value or ""
         row[FLAGS_FIELD] = get_flags_text()
         row[REVIEWED_FIELD] = REVIEWED_TRUE if reviewed_checkbox.value else REVIEWED_FALSE
         save_rows(csv_path, fieldnames, rows)
-        next_index = find_next_unreviewed(current_index)
-        current_index = next_index if next_index is not None else len(rows)
+
+    def go_to(index: int) -> None:
+        nonlocal current_index
+        current_index = index
         refresh()
 
+    def on_save(e: ft.Event) -> None:
+        save_current()
+        page.show_dialog(ft.SnackBar(content=ft.Text("Saved"), duration=1500))
+
+    def on_discard_changes(e: ft.Event) -> None:
+        ask(
+            "Discard changes?",
+            "Any unsaved edits to this box will be lost. Are you sure?",
+            [("Cancel", None), ("Discard changes", refresh)],
+        )
+
+    def discard_box() -> None:
+        # This crop wasn't a real record: drop the row from the catalogue entirely.
+        nonlocal current_index
+        del rows[current_index]
+        save_rows(csv_path, fieldnames, rows)
+        current_index = min(current_index, max(len(rows) - 1, 0))
+        refresh()
+
+    def on_discard_box(e: ft.Event) -> None:
+        ask(
+            "Discard box?",
+            "This permanently removes the box from catalogue.csv. Are you sure?",
+            [("Cancel", None), ("Discard box", discard_box)],
+        )
+
+    def navigate(step: int) -> None:
+        target = current_index + step
+        if not 0 <= target < len(rows):
+            return
+        if not has_unsaved_changes():
+            go_to(target)
+            return
+
+        def save_then_go() -> None:
+            save_current()
+            go_to(target)
+
+        ask(
+            "Unsaved changes",
+            f"Save your changes before going to the {'next' if step > 0 else 'previous'} box?",
+            [("Cancel", None), ("Don't save", lambda: go_to(target)), ("Save", save_then_go)],
+        )
+
     open_folder_btn.on_click = on_open_folder
-    discard_box_btn.on_click = on_discard_box
     discard_changes_btn.on_click = on_discard_changes
-    back_btn.on_click = on_back
-    save_next_btn.on_click = on_save_next
+    discard_box_btn.on_click = on_discard_box
+    save_btn.on_click = on_save
+    prev_btn.on_click = lambda e: navigate(-1)
+    next_btn.on_click = lambda e: navigate(1)
 
     # Left: editable fields. Right: the crop image.
     body = ft.Row(
@@ -394,7 +464,7 @@ def page_main(page: ft.Page) -> None:
     )
 
     buttons_row = ft.Row(
-        controls=[discard_box_btn, discard_changes_btn, back_btn, save_next_btn],
+        controls=[discard_changes_btn, discard_box_btn, save_btn, prev_btn, next_btn],
         alignment=ft.MainAxisAlignment.START,
         spacing=12,
     )
