@@ -195,27 +195,48 @@ def page_main(page: ft.Page) -> None:
 
     status_text = ft.Text(size=16, weight=ft.FontWeight.BOLD)
 
-    open_folder_btn = ft.Button(content="Open outputs folder")
+    open_folder_btn = ft.Button(
+        content="Open outputs folder",
+        icon=ft.Icons.FOLDER_OPEN,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10)
+        )
+    )
 
     discard_changes_btn = ft.Button(
         content="Discard changes",
         icon=ft.Icons.CLOSE,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10)
+        ),
     )
     discard_box_btn = ft.Button(
         content="Discard box",
         icon=ft.Icons.DELETE,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10)
+        ),
     )
     save_btn = ft.Button(
         content="Save",
         icon=ft.Icons.SAVE,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10)
+        ),
     )
     prev_btn = ft.Button(
         content="Prev",
         icon=ft.Icons.ARROW_BACK,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10)
+        ),
     )
     next_btn = ft.Button(
         content="Next",
         icon=ft.Icons.ARROW_FORWARD,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10)
+        ),
     )
 
     def set_controls_enabled(enabled: bool) -> None:
