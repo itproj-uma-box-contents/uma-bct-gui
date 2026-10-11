@@ -209,7 +209,7 @@ def page_main(page: ft.Page) -> None:
 
     reviewed_checkbox = ft.Checkbox(label="Mark as reviewed")
 
-    no_image_placeholder = ft.Text("No image", color=ft.Colors.ON_SURFACE_VARIANT)
+    no_image_placeholder = ft.Text("No image", color=ft.Colors.ON_SURFACE_VARIANT, text_align=ft.TextAlign.CENTER)
     image_area = ft.Container(content=no_image_placeholder, expand=1)
 
     status_text = ft.Text(size=16, weight=ft.FontWeight.BOLD)
