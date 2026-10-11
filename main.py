@@ -200,7 +200,9 @@ def page_main(page: ft.Page) -> None:
         icon=ft.Icons.FOLDER_OPEN,
         style=ft.ButtonStyle(
             shape=ft.RoundedRectangleBorder(radius=10)
-        )
+        ),
+        bgcolor=ft.Colors.PRIMARY_CONTAINER,
+        color=ft.Colors.ON_PRIMARY_CONTAINER
     )
 
     discard_changes_btn = ft.Button(
@@ -209,13 +211,17 @@ def page_main(page: ft.Page) -> None:
         style=ft.ButtonStyle(
             shape=ft.RoundedRectangleBorder(radius=10)
         ),
-    )
+        bgcolor=ft.Colors.ERROR_CONTAINER,
+        color=ft.Colors.ON_ERROR_CONTAINER
+    )   
     discard_box_btn = ft.Button(
         content="Discard box",
         icon=ft.Icons.DELETE,
         style=ft.ButtonStyle(
             shape=ft.RoundedRectangleBorder(radius=10)
         ),
+        bgcolor=ft.Colors.ERROR,
+        color=ft.Colors.ON_ERROR
     )
     save_btn = ft.Button(
         content="Save",
@@ -223,6 +229,8 @@ def page_main(page: ft.Page) -> None:
         style=ft.ButtonStyle(
             shape=ft.RoundedRectangleBorder(radius=10)
         ),
+        bgcolor=ft.Colors.PRIMARY,
+        color=ft.Colors.ON_PRIMARY
     )
     prev_btn = ft.Button(
         content="Prev",
@@ -230,6 +238,8 @@ def page_main(page: ft.Page) -> None:
         style=ft.ButtonStyle(
             shape=ft.RoundedRectangleBorder(radius=10)
         ),
+        bgcolor=ft.Colors.PRIMARY_CONTAINER,
+        color=ft.Colors.ON_PRIMARY_CONTAINER
     )
     next_btn = ft.Button(
         content="Next",
@@ -237,6 +247,8 @@ def page_main(page: ft.Page) -> None:
         style=ft.ButtonStyle(
             shape=ft.RoundedRectangleBorder(radius=10)
         ),
+        bgcolor=ft.Colors.PRIMARY_CONTAINER,
+        color=ft.Colors.ON_PRIMARY_CONTAINER
     )
 
     def set_controls_enabled(enabled: bool) -> None:
