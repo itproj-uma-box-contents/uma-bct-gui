@@ -70,6 +70,25 @@ DEFAULT_FLAG_COLOR = (ft.Colors.GREY_400, ft.Colors.BLACK)
 FORM_WIDTH = 380
 
 
+def action_button(label: str, icon: ft.IconData, bgcolor: ft.ColorValue, color: ft.ColorValue) -> ft.Button:
+    """A rounded button whose custom colours switch to Material's muted
+    disabled look. Button.bgcolor/color apply in every state, so the colours
+    have to be given per ControlState instead."""
+    disabled_bg = ft.Colors.with_opacity(0.3, bgcolor)
+    disabled_fg = ft.Colors.with_opacity(0.3, color)
+    fg = {ft.ControlState.DEFAULT: color, ft.ControlState.DISABLED: disabled_fg}
+    return ft.Button(
+        content=label,
+        icon=icon,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10),
+            bgcolor={ft.ControlState.DEFAULT: bgcolor, ft.ControlState.DISABLED: disabled_bg},
+            color=fg,
+            icon_color=fg,
+        ),
+    )
+
+
 def parse_flags(value: str | None) -> list[str]:
     return [p.strip() for p in (value or "").split(";") if p.strip()]
 
@@ -195,60 +214,41 @@ def page_main(page: ft.Page) -> None:
 
     status_text = ft.Text(size=16, weight=ft.FontWeight.BOLD)
 
-    open_folder_btn = ft.Button(
-        content="Open outputs folder",
-        icon=ft.Icons.FOLDER_OPEN,
-        style=ft.ButtonStyle(
-            shape=ft.RoundedRectangleBorder(radius=10)
-        ),
-        bgcolor=ft.Colors.PRIMARY_CONTAINER,
-        color=ft.Colors.ON_PRIMARY_CONTAINER
+    open_folder_btn = action_button(
+        "Open outputs folder",
+        ft.Icons.FOLDER_OPEN,
+        ft.Colors.PRIMARY_CONTAINER,
+        ft.Colors.ON_PRIMARY_CONTAINER,
     )
-
-    discard_changes_btn = ft.Button(
-        content="Discard changes",
-        icon=ft.Icons.CLOSE,
-        style=ft.ButtonStyle(
-            shape=ft.RoundedRectangleBorder(radius=10)
-        ),
-        bgcolor=ft.Colors.ERROR_CONTAINER,
-        color=ft.Colors.ON_ERROR_CONTAINER
-    )   
-    discard_box_btn = ft.Button(
-        content="Discard box",
-        icon=ft.Icons.DELETE,
-        style=ft.ButtonStyle(
-            shape=ft.RoundedRectangleBorder(radius=10)
-        ),
-        bgcolor=ft.Colors.ERROR,
-        color=ft.Colors.ON_ERROR
+    discard_changes_btn = action_button(
+        "Discard changes",
+        ft.Icons.CLOSE,
+        ft.Colors.ERROR_CONTAINER,
+        ft.Colors.ON_ERROR_CONTAINER,
     )
-    save_btn = ft.Button(
-        content="Save",
-        icon=ft.Icons.SAVE,
-        style=ft.ButtonStyle(
-            shape=ft.RoundedRectangleBorder(radius=10)
-        ),
-        bgcolor=ft.Colors.PRIMARY,
-        color=ft.Colors.ON_PRIMARY
+    discard_box_btn = action_button(
+        "Discard box",
+        ft.Icons.DELETE,
+        ft.Colors.ERROR,
+        ft.Colors.ON_ERROR,
     )
-    prev_btn = ft.Button(
-        content="Prev",
-        icon=ft.Icons.ARROW_BACK,
-        style=ft.ButtonStyle(
-            shape=ft.RoundedRectangleBorder(radius=10)
-        ),
-        bgcolor=ft.Colors.PRIMARY_CONTAINER,
-        color=ft.Colors.ON_PRIMARY_CONTAINER
+    save_btn = action_button(
+        "Save",
+        ft.Icons.SAVE,
+        ft.Colors.PRIMARY,
+        ft.Colors.ON_PRIMARY,
     )
-    next_btn = ft.Button(
-        content="Next",
-        icon=ft.Icons.ARROW_FORWARD,
-        style=ft.ButtonStyle(
-            shape=ft.RoundedRectangleBorder(radius=10)
-        ),
-        bgcolor=ft.Colors.PRIMARY_CONTAINER,
-        color=ft.Colors.ON_PRIMARY_CONTAINER
+    prev_btn = action_button(
+        "Prev",
+        ft.Icons.ARROW_BACK,
+        ft.Colors.PRIMARY_CONTAINER,
+        ft.Colors.ON_PRIMARY_CONTAINER,
+    )
+    next_btn = action_button(
+        "Next",
+        ft.Icons.ARROW_FORWARD,
+        ft.Colors.PRIMARY_CONTAINER,
+        ft.Colors.ON_PRIMARY_CONTAINER,
     )
 
     def set_controls_enabled(enabled: bool) -> None:
