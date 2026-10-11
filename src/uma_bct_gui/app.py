@@ -199,28 +199,23 @@ def page_main(page: ft.Page) -> None:
 
     discard_changes_btn = ft.Button(
         content="Discard changes",
-        bgcolor=ft.Colors.GREY,
-        color=ft.Colors.BLACK,
+        icon=ft.Icons.CLOSE,
     )
     discard_box_btn = ft.Button(
         content="Discard box",
-        bgcolor=ft.Colors.RED,
-        color=ft.Colors.WHITE,
+        icon=ft.Icons.DELETE,
     )
     save_btn = ft.Button(
         content="Save",
-        bgcolor=ft.Colors.BLUE,
-        color=ft.Colors.WHITE,
+        icon=ft.Icons.SAVE,
     )
     prev_btn = ft.Button(
         content="Prev",
-        bgcolor=ft.Colors.GREY,
-        color=ft.Colors.BLACK,
+        icon=ft.Icons.ARROW_BACK,
     )
     next_btn = ft.Button(
         content="Next",
-        bgcolor=ft.Colors.GREY,
-        color=ft.Colors.BLACK,
+        icon=ft.Icons.ARROW_FORWARD,
     )
 
     def set_controls_enabled(enabled: bool) -> None:
