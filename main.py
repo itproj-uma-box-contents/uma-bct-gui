@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Callable
+from copy import copy
 from pathlib import Path
 
 import flet as ft
@@ -66,6 +67,12 @@ FLAG_COLORS: dict[str, tuple[str, str]] = {
 # an older run) — still shown and removable, just not offered when adding.
 DEFAULT_FLAG_COLOR = (ft.Colors.GREY_400, ft.Colors.BLACK)
 
+# Catalogue formats the CLI can produce.
+CATALOGUE_EXTENSIONS = (".csv", ".xlsx")
+# Row-dict key (not a column) remembering which xlsx cells held numbers, so they
+# are written back as numbers rather than text.
+XLSX_NUMERIC_KEY = "\x00numeric"
+
 # Fixed width of the left-hand form column; the image takes whatever's left.
 FORM_WIDTH = 380
 
@@ -93,21 +100,144 @@ def parse_flags(value: str | None) -> list[str]:
     return [p.strip() for p in (value or "").split(";") if p.strip()]
 
 
-def load_rows(csv_path: Path) -> tuple[list[str], list[dict[str, str]]]:
-    """Read catalogue.csv into (header order, row dicts)."""
-    with csv_path.open(newline="", encoding="utf-8") as f:
+class CatalogueError(Exception):
+    """A catalogue file can't be read or written; the message is user-facing."""
+
+
+def find_catalogue(folder: Path) -> Path | None:
+    """The catalogue.csv / catalogue.xlsx in folder (the newer one if both exist)."""
+    candidates = [folder / f"catalogue{ext}" for ext in CATALOGUE_EXTENSIONS]
+    existing = [p for p in candidates if p.is_file()]
+    return max(existing, key=lambda p: p.stat().st_mtime) if existing else None
+
+
+def load_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    """Read a catalogue into (header order, row dicts of strings)."""
+    return _load_xlsx(path) if path.suffix.lower() == ".xlsx" else _load_csv(path)
+
+
+def save_rows(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    """Rewrite the catalogue in full, preserving the original column order."""
+    if path.suffix.lower() == ".xlsx":
+        _save_xlsx(path, fieldnames, rows)
+    else:
+        _save_csv(path, fieldnames, rows)
+
+
+def _load_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         fieldnames = list(reader.fieldnames or [])
         rows = [dict(row) for row in reader]
     return fieldnames, rows
 
 
-def save_rows(csv_path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
-    """Rewrite catalogue.csv in full, preserving the original column order."""
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+def _save_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _openpyxl():
+    # Imported lazily: openpyxl is only installed with the optional "excel" extra.
+    try:
+        import openpyxl
+    except ImportError as ex:
+        raise CatalogueError(
+            "Reading .xlsx catalogues needs the optional 'excel' extra. "
+            "Run the app with:  uv run --extra excel main.py"
+        ) from ex
+    return openpyxl
+
+
+def _cell_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _load_xlsx(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    ws = _openpyxl().load_workbook(path).active
+    header = [c.value for c in ws[1]]
+    while header and header[-1] is None:
+        header.pop()
+    fieldnames = [str(h) for h in header]
+
+    rows: list[dict[str, str]] = []
+    for cells in ws.iter_rows(min_row=2, max_col=len(fieldnames)):
+        if all(c.value is None for c in cells):
+            continue
+        row: dict[str, object] = {}
+        numeric: set[str] = set()
+        for name, cell in zip(fieldnames, cells):
+            if name == IMAGE_LINK_FIELD and cell.hyperlink and cell.hyperlink.target:
+                # The cell shows just the file name; the link holds the real relative path.
+                row[name] = cell.hyperlink.target
+            else:
+                row[name] = _cell_text(cell.value)
+            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                numeric.add(name)
+        row[XLSX_NUMERIC_KEY] = numeric
+        rows.append(row)
+    return fieldnames, rows
+
+
+def _xlsx_value(name: str, text: str, numeric: set[str]) -> object:
+    """Turn a GUI string back into a cell value of the type the CLI wrote."""
+    if text == "":
+        return None
+    if name == REVIEWED_FIELD and text in (REVIEWED_TRUE, REVIEWED_FALSE):
+        return text == REVIEWED_TRUE
+    if name in numeric:
+        for convert in (int, float):
+            try:
+                return convert(text)
+            except ValueError:
+                pass
+    return text
+
+
+def _save_xlsx(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    openpyxl = _openpyxl()
+    from openpyxl.styles import Alignment, Font
+    from openpyxl.utils import get_column_letter
+
+    # Reload from disk so everything we don't touch (column widths, frozen
+    # header, header styling, other sheets) survives; only the cells are rewritten.
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+
+    for col, name in enumerate(fieldnames, start=1):
+        header = ws.cell(1, col)
+        if header.value is None:
+            header.value = name
+            if col > 1:
+                header._style = copy(ws.cell(1, col - 1)._style)
+            ws.column_dimensions[get_column_letter(col)].width = max(len(name) + 4, 14)
+
+    ws.delete_rows(2, ws.max_row)
+    wrap = Alignment(wrap_text=True, vertical="top")
+    link_font = Font(color="FF0000FF", underline="single")
+    for r, row in enumerate(rows, start=2):
+        numeric = row.get(XLSX_NUMERIC_KEY) or set()
+        for col, name in enumerate(fieldnames, start=1):
+            cell = ws.cell(r, col)
+            text = row.get(name) or ""
+            cell.alignment = wrap
+            if name == IMAGE_LINK_FIELD and text:
+                cell.value = text.replace("\\", "/").rsplit("/", 1)[-1]
+                cell.hyperlink = text
+                cell.font = link_font
+            else:
+                cell.value = _xlsx_value(name, text, numeric)
+
+    # Write to a temp file first so a crash can't leave a half-written catalogue.
+    tmp = path.with_name(path.name + ".tmp")
+    wb.save(tmp)
+    tmp.replace(path)
 
 
 def page_main(page: ft.Page) -> None:
@@ -119,7 +249,7 @@ def page_main(page: ft.Page) -> None:
     # Review state. Nothing is loaded until the user picks a folder, so all of
     # this starts empty and is (re)populated by load_folder().
     outputs_dir: Path | None = None
-    csv_path: Path | None = None
+    catalogue_path: Path | None = None
     fieldnames: list[str] = []
     rows: list[dict[str, str]] = []
     form_fields: list[str] = []
@@ -320,8 +450,9 @@ def page_main(page: ft.Page) -> None:
         set_flags(row.get(FLAGS_FIELD, ""))
         reviewed_checkbox.value = row.get(REVIEWED_FIELD, REVIEWED_FALSE) == REVIEWED_TRUE
 
-        # Image paths in the CSV are relative to the outputs directory.
-        image_rel = row.get(IMAGE_LINK_FIELD, "")
+        # Image paths are relative to the outputs directory. The CLI may write them
+        # with Windows backslashes, which aren't separators on other platforms.
+        image_rel = (row.get(IMAGE_LINK_FIELD) or "").replace("\\", "/")
         image_path = outputs_dir / image_rel if outputs_dir and image_rel else None
         if image_path and image_path.is_file():
             # Read bytes directly rather than pointing Image at the path: the
@@ -347,9 +478,9 @@ def page_main(page: ft.Page) -> None:
             page.update()
 
     def show_empty_state(message: str) -> None:
-        nonlocal outputs_dir, csv_path
+        nonlocal outputs_dir, catalogue_path
         outputs_dir = None
-        csv_path = None
+        catalogue_path = None
         page.title = "UMA BCT Review"
         empty_message.value = message
         content_area.content = empty_state
@@ -357,16 +488,21 @@ def page_main(page: ft.Page) -> None:
         page.update()
 
     def load_folder(dir_path: Path) -> None:
-        nonlocal outputs_dir, csv_path, fieldnames, rows, form_fields, current_index
+        nonlocal outputs_dir, catalogue_path, fieldnames, rows, form_fields, current_index
 
-        candidate_csv = dir_path / "catalogue.csv"
-        if not candidate_csv.is_file():
-            show_empty_state(f"No catalogue.csv found in {dir_path}")
+        candidate = find_catalogue(dir_path)
+        if candidate is None:
+            show_empty_state(f"No catalogue.csv or catalogue.xlsx found in {dir_path}")
+            return
+        try:
+            loaded_fieldnames, loaded_rows = load_rows(candidate)
+        except CatalogueError as ex:
+            show_empty_state(str(ex))
             return
 
         outputs_dir = dir_path
-        csv_path = candidate_csv
-        fieldnames, rows = load_rows(csv_path)
+        catalogue_path = candidate
+        fieldnames, rows = loaded_fieldnames, loaded_rows
         if REVIEWED_FIELD not in fieldnames:
             fieldnames.append(REVIEWED_FIELD)
         for row in rows:
@@ -421,7 +557,7 @@ def page_main(page: ft.Page) -> None:
             row[name] = text_fields[name].value or ""
         row[FLAGS_FIELD] = get_flags_text()
         row[REVIEWED_FIELD] = REVIEWED_TRUE if reviewed_checkbox.value else REVIEWED_FALSE
-        save_rows(csv_path, fieldnames, rows)
+        save_rows(catalogue_path, fieldnames, rows)
 
     def go_to(index: int) -> None:
         nonlocal current_index
@@ -443,14 +579,14 @@ def page_main(page: ft.Page) -> None:
         # This crop wasn't a real record: drop the row from the catalogue entirely.
         nonlocal current_index
         del rows[current_index]
-        save_rows(csv_path, fieldnames, rows)
+        save_rows(catalogue_path, fieldnames, rows)
         current_index = min(current_index, max(len(rows) - 1, 0))
         refresh()
 
     def on_discard_box(e: ft.Event) -> None:
         ask(
             "Discard box?",
-            "This permanently removes the box from catalogue.csv. Are you sure?",
+            "This permanently removes the box from the catalogue file. Are you sure?",
             [("Cancel", None), ("Discard box", discard_box)],
         )
 

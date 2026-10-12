@@ -36,4 +36,14 @@ uv run main.py
 
 Alternatively, use `uv run flet run` to enable hot-reloading of the GUI on code-changes.
 
-The GUI opens with nothing loaded. Use the "Open outputs folder" button to pick a CLI outputs directory (one containing `catalogue.csv`) through the OS folder picker.
+The GUI opens with nothing loaded. Use the "Open outputs folder" button to pick a CLI outputs directory (one containing `catalogue.csv` or `catalogue.xlsx`) through the OS folder picker.
+
+### Excel (`catalogue.xlsx`) support
+
+Reading and writing `.xlsx` catalogues needs `openpyxl`, which is an optional dependency (the `excel` extra) so CSV-only users don't have to install it:
+
+```
+uv run --extra excel main.py
+```
+
+(or `uv sync --extra excel` once, to install it into the project environment). If a folder only has a `catalogue.xlsx` and the extra isn't installed, the GUI says so instead of failing. If a folder has both a `.csv` and an `.xlsx`, the more recently modified one is used. Saving rewrites the cells in place, keeping the sheet's column widths, frozen header and image hyperlinks, and stores `Reviewed` as a real TRUE/FALSE column.
