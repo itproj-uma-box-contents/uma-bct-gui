@@ -36,7 +36,13 @@ uv run main.py
 
 Alternatively, use `uv run flet run` to enable hot-reloading of the GUI on code-changes.
 
+An installed package can also be launched with `uma-bct-gui`.
+
 The GUI opens with nothing loaded. Use the "Open outputs folder" button to pick a CLI outputs directory (one containing `catalogue.csv` or `catalogue.xlsx`) through the OS folder picker.
+
+Unsaved changes are checked before moving between records, opening another folder, or closing the window. Failed saves keep your edits available to retry. If another program changes the catalogue, the app asks you to reopen the folder rather than overwrite those changes.
+
+Use the image's Zoom in, Zoom out and Reset / Fit buttons, or scroll to zoom and drag to pan. The status shows reviewed and remaining counts. If every record is reviewed when a folder opens, use "View records" to revisit them.
 
 ### Excel (`catalogue.xlsx`) support
 
@@ -46,4 +52,12 @@ Reading and writing `.xlsx` catalogues needs `openpyxl`, which is an optional de
 uv run --extra excel main.py
 ```
 
-(or `uv sync --extra excel` once, to install it into the project environment). If a folder only has a `catalogue.xlsx` and the extra isn't installed, the GUI says so instead of failing. If a folder has both a `.csv` and an `.xlsx`, the more recently modified one is used. Saving rewrites the cells in place, keeping the sheet's column widths, frozen header and image hyperlinks, and stores `Reviewed` as a real TRUE/FALSE column.
+(or `uv sync --extra excel` once, to install it into the project environment). If a folder only has a `catalogue.xlsx` and the extra isn't installed, the GUI says so instead of failing. If a folder has both a `.csv` and an `.xlsx`, the more recently modified one is used. Saving updates changed cells, preserving existing formatting, comments, cell types and image hyperlinks. New `Reviewed` values are stored as real TRUE/FALSE cells. Both formats are saved to a temporary file before replacing the original.
+
+## Tests
+
+```
+uv run --extra excel python -m unittest discover -s tests -v
+```
+
+CSV and GUI tests also run without the Excel extra; the Excel tests are skipped.
