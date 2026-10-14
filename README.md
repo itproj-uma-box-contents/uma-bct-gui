@@ -61,3 +61,4 @@ uv run --extra excel python -m unittest discover -s tests -v
 ```
 
 CSV and GUI tests also run without the Excel extra; the Excel tests are skipped.
+GitHub Actions runs both setups on pull requests and pushes to `main`.

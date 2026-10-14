@@ -179,6 +179,28 @@ class GuiTests(unittest.TestCase):
         self.page.window.on_event(SimpleNamespace(type=ft.WindowEventType.CLOSE))
         self.page.window.destroy.assert_awaited_once()
 
+    def test_failed_save_on_close_keeps_window_open_and_edits(self):
+        self.open_folder()
+        self.description().value = "Unsaved correction"
+        self.page.window.on_event(SimpleNamespace(type=ft.WindowEventType.CLOSE))
+        with patch.object(main, "save_rows", side_effect=main.CatalogueError("Disk full")):
+            self.choose("Save")
+        self.page.window.destroy.assert_not_awaited()
+        self.assertEqual(self.description().value, "Unsaved correction")
+        self.assertEqual(main.load_rows(self.path)[1][0]["Description"], "First box")
+        self.assertIn("Disk full", self.page.dialogs[-1].content.value)
+
+    def test_discarding_all_records_leaves_safe_empty_state(self):
+        self.open_folder()
+        for _ in range(2):
+            self.click(self.button("Discard box"))
+            self.choose("Discard box")
+        self.assertEqual(main.load_rows(self.path)[1], [])
+        self.assertEqual(self.description().value, "")
+        self.assertTrue(self.description().disabled)
+        for label in ("Save", "Discard box", "Prev", "Next"):
+            self.assertTrue(self.button(label).disabled)
+
     def test_reviewed_catalogue_has_clear_completion_and_revisit_action(self):
         self.write_catalogue(reviewed=True)
         self.open_folder()
