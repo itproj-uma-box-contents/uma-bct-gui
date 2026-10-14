@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import os
+import tempfile
+from bisect import bisect_left
 from collections.abc import Callable
 from copy import copy
 from pathlib import Path
+from xml.etree.ElementTree import ParseError
+from zipfile import BadZipFile
 
 import flet as ft
 
@@ -53,15 +59,15 @@ ALL_FLAGS = [
 # (chip background, chip text/delete-icon color) per flag.
 FLAG_COLORS: dict[str, tuple[str, str]] = {
     DUPLICATE_FLAG: (ft.Colors.PURPLE, ft.Colors.WHITE),
-    MISSING_BOX_FLAG: (ft.Colors.RED, ft.Colors.WHITE),
+    MISSING_BOX_FLAG: (ft.Colors.RED_700, ft.Colors.WHITE),
     LOW_CONFIDENCE_FLAG: (ft.Colors.AMBER, ft.Colors.BLACK),
-    MISSING_IDENTIFIER_FLAG: (ft.Colors.DEEP_ORANGE, ft.Colors.WHITE),
+    MISSING_IDENTIFIER_FLAG: (ft.Colors.DEEP_ORANGE_900, ft.Colors.WHITE),
     AMBIGUOUS_IDENTIFIER_FLAG: (ft.Colors.ORANGE, ft.Colors.BLACK),
-    MULTIPLE_IDENTIFIERS_FLAG: (ft.Colors.PINK, ft.Colors.WHITE),
+    MULTIPLE_IDENTIFIERS_FLAG: (ft.Colors.PINK_700, ft.Colors.WHITE),
     MISSING_UNIT_FLAG: (ft.Colors.BROWN, ft.Colors.WHITE),
     INVALID_UNIT_FLAG: (ft.Colors.DEEP_PURPLE, ft.Colors.WHITE),
     TRANSCRIPTION_MISMATCH_FLAG: (ft.Colors.INDIGO, ft.Colors.WHITE),
-    FALLBACK_USED_FLAG: (ft.Colors.BLUE_GREY, ft.Colors.WHITE),
+    FALLBACK_USED_FLAG: (ft.Colors.BLUE_GREY_600, ft.Colors.WHITE),
 }
 # Covers any flag already in a catalogue but outside the list above (e.g. from
 # an older run) — still shown and removable, just not offered when adding.
@@ -72,6 +78,9 @@ CATALOGUE_EXTENSIONS = (".csv", ".xlsx")
 # Row-dict key (not a column) remembering which xlsx cells held numbers, so they
 # are written back as numbers rather than text.
 XLSX_NUMERIC_KEY = "\x00numeric"
+# Keep the source worksheet position so discarding a record handles blank rows.
+XLSX_ROW_KEY = "\x00row"
+CatalogueRow = dict[str, object]
 
 # Fixed width of the left-hand form column; the image takes whatever's left.
 FORM_WIDTH = 380
@@ -106,33 +115,104 @@ class CatalogueError(Exception):
 
 def find_catalogue(folder: Path) -> Path | None:
     """The catalogue.csv / catalogue.xlsx in folder (the newer one if both exist)."""
-    candidates = [folder / f"catalogue{ext}" for ext in CATALOGUE_EXTENSIONS]
-    existing = [p for p in candidates if p.is_file()]
-    return max(existing, key=lambda p: p.stat().st_mtime) if existing else None
+    try:
+        candidates = [folder / f"catalogue{ext}" for ext in CATALOGUE_EXTENSIONS]
+        existing = [p for p in candidates if p.is_file()]
+        return max(existing, key=lambda p: p.stat().st_mtime) if existing else None
+    except OSError as ex:
+        raise CatalogueError(f"Could not read the selected folder: {ex}") from ex
 
 
-def load_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+def catalogue_revision(path: Path) -> str:
+    """Hash the file contents so a save can detect edits made by another program."""
+    try:
+        with path.open("rb") as source:
+            return hashlib.file_digest(source, "sha256").hexdigest()
+    except OSError as ex:
+        raise CatalogueError(f"Could not read {path.name}: {ex}") from ex
+
+
+def _validate_headers(fieldnames: list[str]) -> None:
+    if not fieldnames or any(not name.strip() or name.startswith("\x00") for name in fieldnames):
+        raise CatalogueError("The catalogue needs a non-empty name for every column.")
+    if len(set(fieldnames)) != len(fieldnames):
+        raise CatalogueError("The catalogue contains duplicate column names.")
+
+
+def load_rows(path: Path) -> tuple[list[str], list[CatalogueRow]]:
     """Read a catalogue into (header order, row dicts of strings)."""
-    return _load_xlsx(path) if path.suffix.lower() == ".xlsx" else _load_csv(path)
+    try:
+        return _load_xlsx(path) if path.suffix.lower() == ".xlsx" else _load_csv(path)
+    except (OSError, UnicodeError, csv.Error, BadZipFile, ParseError, ValueError, KeyError, EOFError) as ex:
+        raise CatalogueError(f"Could not read {path.name}: {ex}") from ex
 
 
-def save_rows(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
-    """Rewrite the catalogue in full, preserving the original column order."""
-    if path.suffix.lower() == ".xlsx":
-        _save_xlsx(path, fieldnames, rows)
-    else:
-        _save_csv(path, fieldnames, rows)
+def save_rows(
+    path: Path,
+    fieldnames: list[str],
+    rows: list[CatalogueRow],
+    *,
+    expected_revision: str | None = None,
+) -> str:
+    """Save beside the original, then replace it only if its contents have not changed."""
+    _validate_headers(fieldnames)
+    temporary_path: Path | None = None
+    try:
+        original_revision = catalogue_revision(path) if path.exists() else None
+        if expected_revision is not None and original_revision != expected_revision:
+            raise CatalogueError("The catalogue changed outside this app. Reopen the folder before saving.")
+        original_mode = path.stat().st_mode if path.exists() else None
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{path.stem}-", suffix=path.suffix, dir=path.parent, delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+
+        saved_positions = []
+        if path.suffix.lower() == ".xlsx":
+            saved_positions = _save_xlsx(path, temporary_path, fieldnames, rows)
+        else:
+            _save_csv(temporary_path, fieldnames, rows)
+        if original_mode is not None:
+            temporary_path.chmod(original_mode & 0o777)
+        with temporary_path.open("rb") as temporary_file:
+            os.fsync(temporary_file.fileno())
+        saved_revision = catalogue_revision(temporary_path)
+        current_revision = catalogue_revision(path) if path.exists() else None
+        if current_revision != original_revision:
+            raise CatalogueError("The catalogue changed outside this app. Reopen the folder before saving.")
+        os.replace(temporary_path, path)
+        temporary_path = None
+
+        # Update row positions only after replacement succeeds, so another discard
+        # still targets the correct worksheet row and failed saves change nothing.
+        for row, row_number in saved_positions:
+            row[XLSX_ROW_KEY] = row_number
+        return saved_revision
+    except (OSError, UnicodeError, csv.Error, BadZipFile, ParseError, ValueError, KeyError, EOFError) as ex:
+        raise CatalogueError(f"Could not save {path.name}: {ex}") from ex
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                # Keep the original save error if cleanup is also denied.
+                pass
 
 
-def _load_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
-    with path.open(newline="", encoding="utf-8") as f:
+def _load_csv(path: Path) -> tuple[list[str], list[CatalogueRow]]:
+    with path.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         fieldnames = list(reader.fieldnames or [])
-        rows = [dict(row) for row in reader]
+        _validate_headers(fieldnames)
+        rows: list[CatalogueRow] = []
+        for row in reader:
+            if None in row:
+                raise CatalogueError(f"CSV row {reader.line_num} has more values than the header.")
+            rows.append({name: value or "" for name, value in row.items()})
     return fieldnames, rows
 
 
-def _save_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+def _save_csv(path: Path, fieldnames: list[str], rows: list[CatalogueRow]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -159,30 +239,57 @@ def _cell_text(value: object) -> str:
     return str(value)
 
 
-def _load_xlsx(path: Path) -> tuple[list[str], list[dict[str, str]]]:
-    ws = _openpyxl().load_workbook(path).active
-    header = [c.value for c in ws[1]]
-    while header and header[-1] is None:
-        header.pop()
-    fieldnames = [str(h) for h in header]
+def _xlsx_cell_text(name: str, cell) -> str:
+    if name == IMAGE_LINK_FIELD and cell.hyperlink and cell.hyperlink.target:
+        # The cell shows a file name; the hyperlink holds the actual crop path.
+        return cell.hyperlink.target
+    if name == REVIEWED_FIELD and isinstance(cell.value, (bool, int, float)) and cell.value in (0, 1):
+        return REVIEWED_TRUE if cell.value else REVIEWED_FALSE
+    return _cell_text(cell.value)
 
-    rows: list[dict[str, str]] = []
-    for cells in ws.iter_rows(min_row=2, max_col=len(fieldnames)):
-        if all(c.value is None for c in cells):
+
+def _check_xlsx_headers(ws) -> None:
+    for column, header in enumerate(ws[1], start=1):
+        if _cell_text(header.value).strip():
             continue
-        row: dict[str, object] = {}
-        numeric: set[str] = set()
-        for name, cell in zip(fieldnames, cells):
-            if name == IMAGE_LINK_FIELD and cell.hyperlink and cell.hyperlink.target:
-                # The cell shows just the file name; the link holds the real relative path.
-                row[name] = cell.hyperlink.target
-            else:
-                row[name] = _cell_text(cell.value)
-            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
-                numeric.add(name)
-        row[XLSX_NUMERIC_KEY] = numeric
-        rows.append(row)
-    return fieldnames, rows
+        for cells in ws.iter_rows(min_row=2, min_col=column, max_col=column):
+            if cells[0].value is not None:
+                raise CatalogueError("Every populated column in the catalogue needs a header.")
+
+
+def _load_xlsx(path: Path) -> tuple[list[str], list[CatalogueRow]]:
+    openpyxl = _openpyxl()
+    try:
+        wb = openpyxl.load_workbook(path)
+    except openpyxl.utils.exceptions.InvalidFileException as ex:
+        raise CatalogueError(f"Could not read {path.name}: {ex}") from ex
+    try:
+        ws = wb.active
+        if ws is None or not hasattr(ws, "iter_rows"):
+            raise CatalogueError("The catalogue needs an active worksheet containing records.")
+        _check_xlsx_headers(ws)
+        header = [c.value for c in ws[1]]
+        while header and header[-1] is None:
+            header.pop()
+        fieldnames = [_cell_text(value) for value in header]
+        _validate_headers(fieldnames)
+
+        rows: list[CatalogueRow] = []
+        for cells in ws.iter_rows(min_row=2, max_col=len(fieldnames)):
+            if all(c.value is None for c in cells):
+                continue
+            row: CatalogueRow = {}
+            numeric: set[str] = set()
+            for name, cell in zip(fieldnames, cells):
+                row[name] = _xlsx_cell_text(name, cell)
+                if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                    numeric.add(name)
+            row[XLSX_NUMERIC_KEY] = numeric
+            row[XLSX_ROW_KEY] = cells[0].row
+            rows.append(row)
+        return fieldnames, rows
+    finally:
+        wb.close()
 
 
 def _xlsx_value(name: str, text: str, numeric: set[str]) -> object:
@@ -200,74 +307,108 @@ def _xlsx_value(name: str, text: str, numeric: set[str]) -> object:
     return text
 
 
-def _save_xlsx(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+def _save_xlsx(
+    path: Path, temporary_path: Path, fieldnames: list[str], rows: list[CatalogueRow]
+) -> list[tuple[CatalogueRow, int]]:
     openpyxl = _openpyxl()
     from openpyxl.styles import Alignment, Font
     from openpyxl.utils import get_column_letter
 
-    # Reload from disk so everything we don't touch (column widths, frozen
-    # header, header styling, other sheets) survives; only the cells are rewritten.
+    # Reload from disk and leave unchanged cells alone, preserving their types,
+    # formulas, comments, formatting, and the rest of the workbook.
     wb = openpyxl.load_workbook(path)
-    ws = wb.active
-
-    for col, name in enumerate(fieldnames, start=1):
-        header = ws.cell(1, col)
-        if header.value is None:
-            header.value = name
-            if col > 1:
-                header._style = copy(ws.cell(1, col - 1)._style)
-            ws.column_dimensions[get_column_letter(col)].width = max(len(name) + 4, 14)
-
-    ws.delete_rows(2, ws.max_row)
-    wrap = Alignment(wrap_text=True, vertical="top")
-    link_font = Font(color="FF0000FF", underline="single")
-    for r, row in enumerate(rows, start=2):
-        numeric = row.get(XLSX_NUMERIC_KEY) or set()
+    try:
+        ws = wb.active
+        if ws is None or not hasattr(ws, "iter_rows"):
+            raise CatalogueError("The catalogue needs an active worksheet containing records.")
+        _check_xlsx_headers(ws)
         for col, name in enumerate(fieldnames, start=1):
-            cell = ws.cell(r, col)
-            text = row.get(name) or ""
-            cell.alignment = wrap
-            if name == IMAGE_LINK_FIELD and text:
-                cell.value = text.replace("\\", "/").rsplit("/", 1)[-1]
-                cell.hyperlink = text
-                cell.font = link_font
-            else:
-                cell.value = _xlsx_value(name, text, numeric)
+            header = ws.cell(1, col)
+            if header.value is None:
+                header.value = name
+                if col > 1:
+                    header._style = copy(ws.cell(1, col - 1)._style)
+                ws.column_dimensions[get_column_letter(col)].width = max(len(name) + 4, 14)
 
-    # Write to a temp file first so a crash can't leave a half-written catalogue.
-    tmp = path.with_name(path.name + ".tmp")
-    wb.save(tmp)
-    tmp.replace(path)
+        data_positions = [
+            cells[0].row
+            for cells in ws.iter_rows(min_row=2, max_col=len(fieldnames))
+            if any(cell.value is not None for cell in cells)
+        ]
+        # Loaded rows carry their worksheet positions, including any gaps caused
+        # by blank rows. Plain row dictionaries still work in their existing order.
+        has_positions = any(XLSX_ROW_KEY in row for row in rows)
+        positions = []
+        for index, row in enumerate(rows):
+            if has_positions:
+                positions.append(row.get(XLSX_ROW_KEY))
+            elif index < len(data_positions):
+                positions.append(data_positions[index])
+            else:
+                positions.append(None)
+        retained_positions = {position for position in positions if position is not None}
+        deleted_positions = [position for position in data_positions if position not in retained_positions]
+        for position in reversed(deleted_positions):
+            ws.delete_rows(position)
+
+        saved_positions: list[tuple[CatalogueRow, int]] = []
+        for row, old_position in zip(rows, positions):
+            row_number = (
+                old_position - bisect_left(deleted_positions, old_position)
+                if old_position is not None
+                else max(ws.max_row + 1, 2)
+            )
+            numeric = row.get(XLSX_NUMERIC_KEY) or set()
+            for col, name in enumerate(fieldnames, start=1):
+                cell = ws.cell(row_number, col)
+                if cell.hyperlink:
+                    # Moving a worksheet row does not update its hyperlink refs.
+                    cell.hyperlink.ref = cell.coordinate
+                text = _cell_text(row.get(name))
+                if _xlsx_cell_text(name, cell) == text:
+                    continue
+                if cell.value is None:
+                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+                if name == IMAGE_LINK_FIELD and text:
+                    cell.value = text.replace("\\", "/").rsplit("/", 1)[-1]
+                    cell.data_type = "s"
+                    cell.hyperlink = text
+                    cell.font = Font(color="FF0000FF", underline="single")
+                else:
+                    cell.value = _xlsx_value(name, text, numeric)
+                    if isinstance(cell.value, str):
+                        # Transcriptions beginning with '=' are literal text.
+                        cell.data_type = "s"
+                    if name == IMAGE_LINK_FIELD:
+                        cell.hyperlink = None
+            saved_positions.append((row, row_number))
+        wb.save(temporary_path)
+        return saved_positions
+    finally:
+        wb.close()
 
 
 def page_main(page: ft.Page) -> None:
     page.title = "UMA BCT Review"
     page.window.width = 1200
     page.window.height = 800
+    page.window.min_width = 850
+    page.window.min_height = 600
+    page.window.prevent_close = True
     page.padding = 20
 
     # Review state. Nothing is loaded until the user picks a folder, so all of
     # this starts empty and is (re)populated by load_folder().
     outputs_dir: Path | None = None
     catalogue_path: Path | None = None
+    loaded_revision: str | None = None
     fieldnames: list[str] = []
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, object]] = []
     form_fields: list[str] = []
     current_index = 0
     text_fields: dict[str, ft.TextField] = {}
 
     file_picker = ft.FilePicker()
-
-    # Only used to report a folder-selection error; the "nothing to review"
-    # state (no folder open yet, or every row already reviewed) reuses the
-    # normal body view instead — see refresh()'s current_index >= len(rows) branch.
-    empty_message = ft.Text(size=18, weight=ft.FontWeight.BOLD)
-    empty_state = ft.Column(
-        controls=[empty_message],
-        alignment=ft.MainAxisAlignment.CENTER,
-        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-        expand=True,
-    )
 
     # Populated by load_folder() with one TextField per catalogue column. Fixed
     # width rather than expand=1, so it sizes to its fields and leaves the rest
@@ -341,6 +482,30 @@ def page_main(page: ft.Page) -> None:
 
     no_image_placeholder = ft.Text("No image", color=ft.Colors.ON_SURFACE_VARIANT, text_align=ft.TextAlign.CENTER)
     image_area = ft.Container(content=no_image_placeholder, expand=1)
+    image_viewer: ft.InteractiveViewer | None = None
+
+    async def zoom_in(e: ft.Event) -> None:
+        if image_viewer:
+            await image_viewer.zoom(1.25)
+
+    async def zoom_out(e: ft.Event) -> None:
+        if image_viewer:
+            await image_viewer.zoom(0.8)
+
+    async def reset_image(e: ft.Event) -> None:
+        if image_viewer:
+            await image_viewer.reset()
+
+    zoom_controls = ft.Row(
+        controls=[
+            ft.TextButton("Zoom in", on_click=zoom_in),
+            ft.TextButton("Zoom out", on_click=zoom_out),
+            ft.TextButton("Reset / Fit", on_click=reset_image),
+            ft.Text("Scroll to zoom; drag to pan", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+        ],
+        wrap=True,
+        visible=False,
+    )
 
     status_text = ft.Text(size=16, weight=ft.FontWeight.BOLD)
 
@@ -380,6 +545,7 @@ def page_main(page: ft.Page) -> None:
         ft.Colors.PRIMARY_CONTAINER,
         ft.Colors.ON_PRIMARY_CONTAINER,
     )
+    view_records_btn = ft.TextButton("View records", on_click=lambda e: go_to(0), visible=False)
 
     def set_controls_enabled(enabled: bool) -> None:
         for tf in text_fields.values():
@@ -414,6 +580,33 @@ def page_main(page: ft.Page) -> None:
             )
         )
 
+    def show_error(title: str, message: str) -> None:
+        ask(title, message, [("OK", None)])
+
+    def confirm_unsaved_changes(action: str, callback: Callable[[], None]) -> None:
+        if not has_unsaved_changes():
+            callback()
+            return
+
+        def save_then_continue() -> None:
+            if save_current():
+                callback()
+
+        ask(
+            "Unsaved changes",
+            f"Save your changes before {action}?",
+            [("Cancel", None), ("Don't save", callback), ("Save", save_then_continue)],
+        )
+
+    def close_window() -> None:
+        page.run_task(page.window.destroy)
+
+    def on_window_event(e: ft.WindowEvent) -> None:
+        if e.type == ft.WindowEventType.CLOSE:
+            confirm_unsaved_changes("closing the window", close_window)
+
+    page.window.on_event = on_window_event
+
     def find_next_unreviewed(after_index: int) -> int | None:
         """Search forward from after_index, wrapping around, for an unreviewed
         row. Passing -1 searches the whole list starting from the first row."""
@@ -424,21 +617,41 @@ def page_main(page: ft.Page) -> None:
                 return idx
         return None
 
+    def update_status() -> None:
+        reviewed = sum(row.get(REVIEWED_FIELD) == REVIEWED_TRUE for row in rows)
+        if catalogue_path is None:
+            status_text.value = "Open an outputs folder to begin"
+        elif not rows:
+            status_text.value = "This catalogue has no records"
+        elif current_index >= len(rows):
+            status_text.value = f"All {len(rows)} records reviewed"
+        else:
+            status_text.value = (
+                f"Record {current_index + 1} of {len(rows)} · "
+                f"{reviewed} reviewed, {len(rows) - reviewed} remaining"
+            )
+
     def refresh(update: bool = True) -> None:
-        """Repaint the form/image/status for current_index, or show the same
-        "nothing to review" state whether no folder is open yet (0 of 0) or
-        every row in it has been reviewed (0 of however many there are)."""
+        """Show the current record, or explain why there is nothing to review."""
+        nonlocal image_viewer
+        update_status()
+        view_records_btn.visible = bool(rows) and current_index >= len(rows)
+        image_viewer = None
+        zoom_controls.visible = False
         # In the "nothing to review" state current_index == len(rows), so Prev
         # still lets the user step back into the last record.
         prev_btn.disabled = current_index <= 0
         next_btn.disabled = current_index >= len(rows) - 1
         if current_index >= len(rows):
-            status_text.value = f"Record 0 of {len(rows)}"
             for tf in text_fields.values():
                 tf.value = ""
             flags_row.controls = []
             reviewed_checkbox.value = False
-            image_area.content = no_image_placeholder
+            image_area.content = ft.Text(
+                status_text.value,
+                text_align=ft.TextAlign.CENTER,
+                color=ft.Colors.ON_SURFACE_VARIANT,
+            )
             set_controls_enabled(False)
             if update:
                 page.update()
@@ -454,12 +667,21 @@ def page_main(page: ft.Page) -> None:
         # with Windows backslashes, which aren't separators on other platforms.
         image_rel = (row.get(IMAGE_LINK_FIELD) or "").replace("\\", "/")
         image_path = outputs_dir / image_rel if outputs_dir and image_rel else None
-        if image_path and image_path.is_file():
+        image_bytes = None
+        image_message = "No image"
+        if image_path:
+            try:
+                image_bytes = image_path.read_bytes()
+            except FileNotFoundError:
+                image_message = "Image file not found"
+            except (OSError, ValueError):
+                image_message = "Couldn't read this image"
+        if image_bytes:
             # Read bytes directly rather than pointing Image at the path: the
             # outputs dir is arbitrary and outside Flet's assets_dir.
-            image_area.content = ft.InteractiveViewer(
+            image_viewer = ft.InteractiveViewer(
                 content=ft.Image(
-                    src=image_path.read_bytes(),
+                    src=image_bytes,
                     fit=ft.BoxFit.CONTAIN,
                     expand=True,
                     error_content=no_image_placeholder,
@@ -469,43 +691,44 @@ def page_main(page: ft.Page) -> None:
                 # Lets trackpad scrolling zoom, not just pan, matching mouse-wheel zoom.
                 trackpad_scroll_causes_scale=True,
             )
+            image_area.content = image_viewer
+            zoom_controls.visible = True
         else:
-            image_area.content = no_image_placeholder
+            image_area.content = ft.Text(
+                image_message,
+                text_align=ft.TextAlign.CENTER,
+                color=ft.Colors.ON_SURFACE_VARIANT,
+            )
 
-        status_text.value = f"Record {current_index + 1} of {len(rows)}"
         set_controls_enabled(True)
         if update:
             page.update()
 
-    def show_empty_state(message: str) -> None:
-        nonlocal outputs_dir, catalogue_path
-        outputs_dir = None
-        catalogue_path = None
-        page.title = "UMA BCT Review"
-        empty_message.value = message
-        content_area.content = empty_state
-        buttons_row.visible = False
-        page.update()
-
     def load_folder(dir_path: Path) -> None:
         nonlocal outputs_dir, catalogue_path, fieldnames, rows, form_fields, current_index
+        nonlocal loaded_revision
 
-        candidate = find_catalogue(dir_path)
-        if candidate is None:
-            show_empty_state(f"No catalogue.csv or catalogue.xlsx found in {dir_path}")
-            return
         try:
+            candidate = find_catalogue(dir_path)
+            if candidate is None:
+                raise CatalogueError(f"No catalogue.csv or catalogue.xlsx found in {dir_path}")
+            revision = catalogue_revision(candidate)
             loaded_fieldnames, loaded_rows = load_rows(candidate)
-        except CatalogueError as ex:
-            show_empty_state(str(ex))
+            if catalogue_revision(candidate) != revision:
+                raise CatalogueError("The catalogue changed while opening it. Please try again.")
+        except (CatalogueError, OSError) as ex:
+            show_error("Couldn't open folder", str(ex))
             return
 
         outputs_dir = dir_path
         catalogue_path = candidate
+        loaded_revision = revision
         fieldnames, rows = loaded_fieldnames, loaded_rows
-        if REVIEWED_FIELD not in fieldnames:
-            fieldnames.append(REVIEWED_FIELD)
+        for name in (FLAGS_FIELD, REVIEWED_FIELD):
+            if name not in fieldnames:
+                fieldnames.append(name)
         for row in rows:
+            row.setdefault(FLAGS_FIELD, "")
             row.setdefault(REVIEWED_FIELD, REVIEWED_FALSE)
         form_fields = [name for name in fieldnames if name not in CUSTOM_FIELDS]
         first_unreviewed = find_next_unreviewed(-1)
@@ -525,8 +748,6 @@ def page_main(page: ft.Page) -> None:
         form_column.controls = [*text_fields.values(), flags_block, reviewed_checkbox]
 
         page.title = f"UMA BCT Review — {outputs_dir.name}"
-        content_area.content = body
-        buttons_row.visible = True
         refresh()
 
     async def on_open_folder(e: ft.Event) -> None:
@@ -535,10 +756,10 @@ def page_main(page: ft.Page) -> None:
                 dialog_title="Select outputs folder"
             )
         except Exception as ex:
-            show_empty_state(f"Couldn't open the folder picker: {ex}")
+            show_error("Couldn't open folder picker", str(ex))
             return
         if selected:
-            load_folder(Path(selected))
+            confirm_unsaved_changes("opening another folder", lambda: load_folder(Path(selected)))
 
     def has_unsaved_changes() -> bool:
         if current_index >= len(rows):
@@ -551,13 +772,28 @@ def page_main(page: ft.Page) -> None:
         saved_reviewed = row.get(REVIEWED_FIELD, REVIEWED_FALSE) == REVIEWED_TRUE
         return bool(reviewed_checkbox.value) != saved_reviewed
 
-    def save_current() -> None:
-        row = rows[current_index]
+    def write_changes(updated_rows: list[dict[str, object]]) -> bool:
+        nonlocal rows, loaded_revision
+        try:
+            revision = save_rows(
+                catalogue_path, fieldnames, updated_rows, expected_revision=loaded_revision
+            )
+        except CatalogueError as ex:
+            show_error("Couldn't save catalogue", str(ex))
+            return False
+        rows = updated_rows
+        loaded_revision = revision
+        return True
+
+    def save_current() -> bool:
+        row = rows[current_index].copy()
         for name in form_fields:
             row[name] = text_fields[name].value or ""
         row[FLAGS_FIELD] = get_flags_text()
         row[REVIEWED_FIELD] = REVIEWED_TRUE if reviewed_checkbox.value else REVIEWED_FALSE
-        save_rows(catalogue_path, fieldnames, rows)
+        updated_rows = list(rows)
+        updated_rows[current_index] = row
+        return write_changes(updated_rows)
 
     def go_to(index: int) -> None:
         nonlocal current_index
@@ -565,8 +801,10 @@ def page_main(page: ft.Page) -> None:
         refresh()
 
     def on_save(e: ft.Event) -> None:
-        save_current()
-        page.show_dialog(ft.SnackBar(content=ft.Text("Saved"), duration=1500))
+        if save_current():
+            update_status()
+            page.update()
+            page.show_dialog(ft.SnackBar(content=ft.Text("Saved"), duration=1500))
 
     def on_discard_changes(e: ft.Event) -> None:
         ask(
@@ -578,8 +816,9 @@ def page_main(page: ft.Page) -> None:
     def discard_box() -> None:
         # This crop wasn't a real record: drop the row from the catalogue entirely.
         nonlocal current_index
-        del rows[current_index]
-        save_rows(catalogue_path, fieldnames, rows)
+        updated_rows = rows[:current_index] + rows[current_index + 1:]
+        if not write_changes(updated_rows):
+            return
         current_index = min(current_index, max(len(rows) - 1, 0))
         refresh()
 
@@ -594,18 +833,8 @@ def page_main(page: ft.Page) -> None:
         target = current_index + step
         if not 0 <= target < len(rows):
             return
-        if not has_unsaved_changes():
-            go_to(target)
-            return
-
-        def save_then_go() -> None:
-            save_current()
-            go_to(target)
-
-        ask(
-            "Unsaved changes",
-            f"Save your changes before going to the {'next' if step > 0 else 'previous'} box?",
-            [("Cancel", None), ("Don't save", lambda: go_to(target)), ("Save", save_then_go)],
+        confirm_unsaved_changes(
+            f"going to the {'next' if step > 0 else 'previous'} box", lambda: go_to(target)
         )
 
     open_folder_btn.on_click = on_open_folder
@@ -616,25 +845,31 @@ def page_main(page: ft.Page) -> None:
     next_btn.on_click = lambda e: navigate(1)
 
     # Left: editable fields. Right: the crop image.
+    image_column = ft.Column(
+        controls=[image_area, zoom_controls],
+        expand=True,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+    )
     body = ft.Row(
-        controls=[form_column, image_area],
+        controls=[form_column, image_column],
         expand=True,
         spacing=24,
     )
 
     top_bar = ft.Row(
-        controls=[open_folder_btn, status_text],
+        controls=[open_folder_btn, status_text, view_records_btn],
         spacing=16,
+        wrap=True,
     )
 
     buttons_row = ft.Row(
         controls=[discard_changes_btn, discard_box_btn, save_btn, prev_btn, next_btn],
         alignment=ft.MainAxisAlignment.START,
         spacing=12,
+        wrap=True,
+        run_spacing=8,
     )
 
-    # Normally shows body (refresh() renders its own "nothing to review" state
-    # there when needed); swapped to empty_state only for a folder-selection error.
     content_area = ft.Container(content=body, expand=True)
 
     page.add(
