@@ -55,6 +55,26 @@ def create_batches(root):
             workbook.close()
 
 
+async def resize_window(page, width, height):
+    resized = asyncio.Event()
+    original_handler = page.on_resize
+
+    def on_resize(event):
+        original_handler(event)
+        if (event.width < main.COMPACT_WIDTH) == (width < main.COMPACT_WIDTH):
+            resized.set()
+
+    page.on_resize = on_resize
+    try:
+        page.window.width, page.window.height = width, height
+        page.update()
+        await asyncio.wait_for(resized.wait(), timeout=10)
+    finally:
+        page.on_resize = original_handler
+    # Wait for Flutter to paint the new layout before invoking its controls.
+    await page.take_screenshot()
+
+
 def run():
     completed = []
     with tempfile.TemporaryDirectory(prefix="uma-bct-desktop-") as temporary:
@@ -69,6 +89,7 @@ def run():
                 previous_theme = await asyncio.wait_for(preferences.get(main.THEME_PREFERENCE), timeout=3)
                 preference_loaded = True
                 await main.page_main(page)
+                page.enable_screenshots = True
 
                 def controls():
                     return [child for control in page.controls for child in walk(control)]
@@ -83,16 +104,15 @@ def run():
                     description = next(c for c in controls() if isinstance(c, ft.TextField) and c.label == "Description")
                     await description.focus()
                     description.value = "Saved correction — café"
-                    page.window.width, page.window.height = size
-                    page.update()
-                    await asyncio.sleep(0.5)
+                    await resize_window(page, *size)
                     assert description.value == "Saved correction — café"
                     if suffix == "csv":
                         toggle = next(c for c in controls() if isinstance(c, ft.IconButton))
                         await toggle.on_click(None)
                         assert await preferences.get(main.THEME_PREFERENCE) == page.theme_mode.value
+                        await page.take_screenshot()
                         await page.controls[0].controls[1].scroll_to(offset=-1)
-                        await asyncio.sleep(0.2)
+                        await page.take_screenshot()
                     for label in ("Zoom in", "Zoom out", "Reset / Fit"):
                         await button(label).on_click(None)
                     with patch.object(page, "show_dialog", wraps=page.show_dialog) as show_dialog:

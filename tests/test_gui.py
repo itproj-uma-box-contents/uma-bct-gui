@@ -26,10 +26,11 @@ class TestPage:
     def add(self, control):
         self.controls.append(control)
 
-    def update(self):
-        pass
+    def update(self, *controls):
+        self.dialogs[:] = [dialog for dialog in self.dialogs if dialog.open]
 
     def show_dialog(self, dialog):
+        dialog.open = True
         self.dialogs.append(dialog)
 
     def pop_dialog(self):
@@ -291,6 +292,42 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.page.theme_mode, ft.ThemeMode.DARK)
         self.assertFalse(toggle.disabled)
         self.assertIn("this session", self.page.dialogs[-1].content.value)
+
+    def test_theme_failure_cannot_keep_discard_confirmation_open_or_repeat_deletion(self):
+        self.open_folder()
+
+        async def exercise():
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def fail_later(key, value):
+                started.set()
+                await release.wait()
+                raise RuntimeError("Unavailable storage")
+
+            self.set_preference.side_effect = fail_later
+            toggle = next(c for c in self.controls() if isinstance(c, ft.IconButton))
+            task = asyncio.create_task(toggle.on_click(None))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            self.click(self.button("Discard box"))
+            confirmation = self.page.dialogs[-1]
+            confirm_button = next(c for c in confirmation.actions if c.content == "Discard box")
+
+            with self.assertLogs(main.logger, level="WARNING"):
+                release.set()
+                await task
+            notification = self.page.dialogs[-1]
+            self.assertIsInstance(notification, ft.SnackBar)
+            self.click(confirm_button)
+            self.assertFalse(confirmation.open)
+            self.assertTrue(notification.open)
+            self.assertEqual(len(main.load_rows(self.path)[1]), 1)
+
+            # A second click can already be queued while the dialog is closing.
+            self.click(confirm_button)
+            self.assertEqual(len(main.load_rows(self.path)[1]), 1)
+
+        asyncio.run(exercise())
 
     def test_resizing_retains_unsaved_form_values_and_flags(self):
         self.open_folder()

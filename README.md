@@ -18,11 +18,13 @@ The following screenshot (of the "Add flag" menu) shows the flags available and 
 
 ## Setup
 
-Use Python 3.12 or newer. Normal setup includes the Flet desktop runtime and Excel file support:
+Use Python 3.12 or newer. Normal setup includes Flet desktop support and Excel file support:
 
 ```
 uv sync --locked
 ```
+
+The first launch may download the native Flet client from GitHub if it is not already available locally. Complete that first launch while online before using the app offline.
 
 On Ubuntu desktop, the native folder picker also needs Zenity:
 

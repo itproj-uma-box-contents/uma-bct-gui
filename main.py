@@ -149,9 +149,12 @@ def resolve_image_path(folder: Path, reference: str, *, url_encoded: bool = Fals
     windows_drive = bool(re.match(r"^[A-Za-z]:/", target))
     if not windows_drive:
         url = urlsplit(target)
-        if url.scheme:
-            if url.scheme.lower() != "file":
+        if url.scheme and url.scheme.lower() != "file":
+            # A colon is legal in a POSIX filename. Keep an existing local file
+            # working when its bare name could be mistaken for a URI scheme.
+            if "://" in target or not (folder / target).is_file():
                 raise ValueError("Only local image files are supported.")
+        elif url.scheme:
             target = unquote(url.path)
             if url.netloc and url.netloc.lower() != "localhost":
                 if os.name != "nt":
@@ -748,23 +751,30 @@ async def page_main(page: ft.Page) -> None:
     def ask(title: str, message: str, options: list[tuple[str, Callable[[], None] | None]]) -> None:
         """Show a modal dialog with one button per (label, callback) option; the
         dialog closes first, then the chosen callback (if any) runs."""
+        handled = False
 
         def make_handler(callback: Callable[[], None] | None):
             def handler(e: ft.Event) -> None:
-                page.pop_dialog()
+                nonlocal handled
+                if handled or not dialog.open:
+                    return
+                handled = True
+                # A delayed notification may be above this dialog. Close this
+                # instance, and ignore clicks queued during its closing animation.
+                dialog.open = False
+                page.update(dialog)
                 if callback:
                     callback()
 
             return handler
 
-        page.show_dialog(
-            ft.AlertDialog(
-                modal=True,
-                title=ft.Text(title),
-                content=ft.Text(message),
-                actions=[ft.TextButton(label, on_click=make_handler(cb)) for label, cb in options],
-            )
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(title),
+            content=ft.Text(message),
+            actions=[ft.TextButton(label, on_click=make_handler(cb)) for label, cb in options],
         )
+        page.show_dialog(dialog)
 
     def show_error(title: str, message: str) -> None:
         ask(title, message, [("OK", None)])

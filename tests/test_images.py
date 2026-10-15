@@ -37,6 +37,23 @@ class ImageReferenceTests(unittest.TestCase):
         self.assertIsNone(main.resolve_image_path(self.folder, ""))
         self.assertIsNone(main.resolve_image_path(self.folder, '=HYPERLINK("","")'))
 
+    @unittest.skipIf(os.name == "nt", "Colons are not valid Windows filenames")
+    def test_existing_colon_filename_is_a_local_path_but_remote_urls_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            local = folder / "box:01.png"
+            local.write_bytes(b"image")
+            for reference in (local.name, '=HYPERLINK("box:01.png","Box")', local.as_uri()):
+                with self.subTest(reference=reference):
+                    self.assertEqual(main.resolve_image_path(folder, reference), local)
+            # Even a matching local directory must not turn a remote URL into
+            # a supported image reference.
+            remote_lookalike = folder / "https:" / "example.com" / "box.png"
+            remote_lookalike.parent.mkdir(parents=True)
+            remote_lookalike.write_bytes(b"image")
+            with self.assertRaises(ValueError):
+                main.resolve_image_path(folder, "https://example.com/box.png")
+
     def test_native_link_falls_back_to_an_existing_literal_percent_filename(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)

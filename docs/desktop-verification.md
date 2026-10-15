@@ -6,7 +6,7 @@ Local environment: Apple Silicon, macOS 26.4, Python 3.12.13, Flet/desktop 1.0.1
 
 | Check | Result |
 | --- | --- |
-| Unit regressions | 64 cases: 61 passed; 3 Windows-only cases skipped on macOS. |
+| Unit regressions | 66 cases: 63 passed; 3 Windows-only cases skipped on macOS. Includes overlapping notifications/confirmations and local filenames containing colons. |
 | Native Mac startup and folder picker | App launched at the requested size; native folder selection opened a temporary batch copy. Native centring returned successfully. Multi-monitor placement still needs manual verification. |
 | Supplied batch copy | All seven image references resolved and two records intentionally had no image. Native preview rendering was inspected. Original batch files were not edited. |
 | Native CSV and XLSX review | Saves, navigation, unsaved-edit cancellation, and image previews passed with the real Flutter client. XLSX opened the Catalogue worksheet while Notes was active. |
