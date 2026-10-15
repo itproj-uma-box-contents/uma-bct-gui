@@ -5,13 +5,15 @@ description = "GUI for manually verifying VLM-transcribed UMA box catalogue outp
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "flet>=1.0.1",
+    "flet[desktop]>=1.0.1",
+    "openpyxl>=3.1",
 ]
 
 [project.scripts]
 uma-bct-gui = "main:main"
 
 [project.optional-dependencies]
+# Keep the original launch command working; Excel support is now included.
 excel = [
     "openpyxl>=3.1",
 ]

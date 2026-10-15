@@ -1,4 +1,6 @@
 import csv
+import errno
+import os
 import tempfile
 import unittest
 from datetime import datetime
@@ -35,6 +37,92 @@ class CatalogueTestCase(unittest.TestCase):
 
 
 class CatalogueTests(CatalogueTestCase):
+    def test_discovery_preserves_filename_and_selects_newest_with_csv_tie(self):
+        csv_path = self.folder / "Catalogue.CSV"
+        xlsx_path = self.folder / "CATALOGUE.xlsx"
+        csv_path.touch()
+        xlsx_path.touch()
+        os.utime(csv_path, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(xlsx_path, ns=(2_000_000_000, 2_000_000_000))
+        self.assertEqual(main.find_catalogue(self.folder), xlsx_path)
+        os.utime(csv_path, ns=(2_000_000_000, 2_000_000_000))
+        self.assertEqual(main.find_catalogue(self.folder), csv_path)
+
+    def test_discovery_rejects_ambiguous_casing(self):
+        # Mock the directory listing so this also runs on case-insensitive disks.
+        paths = [self.folder / "catalogue.csv", self.folder / "Catalogue.CSV"]
+        with patch.object(Path, "iterdir", return_value=iter(paths)), patch.object(Path, "is_file", return_value=True):
+            with self.assertRaisesRegex(main.CatalogueError, "different casing"):
+                main.find_catalogue(self.folder)
+
+    def test_csv_normalizes_reviewed_values_and_rejects_unknown_values(self):
+        path = self.folder / "catalogue.csv"
+        values = ["TRUE", "false", "1", "0", " True ", ""]
+        with path.open("w", newline="", encoding="utf-8") as output:
+            writer = csv.writer(output)
+            writer.writerow(self.fields)
+            writer.writerows(["Record", "", value] for value in values)
+        _, rows = main.load_rows(path)
+        self.assertEqual([row[main.REVIEWED_FIELD] for row in rows], ["True", "False", "True", "False", "True", "False"])
+        path.write_text("Description,Reviewed\nRecord,maybe\n", encoding="utf-8")
+        with self.assertRaisesRegex(main.CatalogueError, "CSV row 2"):
+            main.load_rows(path)
+
+    def test_csv_saves_bom_and_preserves_literal_image_formula_and_identifiers(self):
+        path = self.write_csv()
+        fields, rows = main.load_rows(path)
+        fields.append("Unit Number")
+        rows[0]["Unit Number"] = "0007"
+        rows[0]["Description"] = 'Café, "box"\nSecond line'
+        rows[0][main.IMAGE_LINK_FIELD] = '=HYPERLINK("Box Images/box.png","box.png")'
+        main.save_rows(path, fields, rows)
+        self.assertTrue(path.read_bytes().startswith(b"\xef\xbb\xbf"))
+        self.assertEqual(main.load_rows(path), (fields, rows))
+
+    def test_sync_handle_is_writable_and_sync_failure_keeps_original(self):
+        path = self.write_csv()
+        fields, rows = main.load_rows(path)
+        sync = os.fsync
+
+        def require_writable_handle(fd):
+            os.write(fd, b"")  # Fails on a read-only handle, including on POSIX.
+            sync(fd)
+
+        with patch("main.os.fsync", side_effect=require_writable_handle):
+            main.save_rows(path, fields, rows)
+        original = path.read_bytes()
+        rows[0]["Description"] = "Unsaved edit"
+        with patch("main.os.fsync", side_effect=OSError(errno.ENOSPC, "Disk full")):
+            with self.assertRaisesRegex(main.CatalogueError, "storage space"):
+                main.save_rows(path, fields, rows)
+        self.assertEqual(path.read_bytes(), original)
+        self.assert_no_temp_files(path)
+
+    def test_permission_failure_explains_retry_and_keeps_original(self):
+        path = self.write_csv()
+        original = path.read_bytes()
+        fields, rows = main.load_rows(path)
+        with patch("main.os.replace", side_effect=PermissionError("File in use")):
+            with self.assertRaisesRegex(main.CatalogueError, "Close it in Excel or Numbers"):
+                main.save_rows(path, fields, rows)
+        self.assertEqual(path.read_bytes(), original)
+        self.assert_no_temp_files(path)
+
+    @unittest.skipUnless(os.name == "nt", "Windows replacement of an open file")
+    def test_windows_locked_catalogue_preserves_original_and_can_be_retried(self):
+        path = self.write_csv()
+        fields, rows = main.load_rows(path)
+        revision = main.catalogue_revision(path)
+        original = path.read_bytes()
+        rows[0]["Description"] = "Retry this correction"
+        with path.open("rb"):
+            with self.assertRaises(main.CatalogueError):
+                main.save_rows(path, fields, rows, expected_revision=revision)
+            self.assertEqual(path.read_bytes(), original)
+        self.assert_no_temp_files(path)
+        main.save_rows(path, fields, rows, expected_revision=revision)
+        self.assertEqual(main.load_rows(path)[1][0]["Description"], "Retry this correction")
+
     def test_csv_round_trip_preserves_columns_and_text(self):
         path = self.write_csv()
         fields, rows = main.load_rows(path)
@@ -65,6 +153,12 @@ class CatalogueTests(CatalogueTestCase):
                 path.write_text(content, encoding="utf-8")
                 with self.assertRaises(main.CatalogueError):
                     main.load_rows(path)
+
+    def test_csv_rejects_an_unclosed_quoted_field(self):
+        path = self.folder / "catalogue.csv"
+        path.write_text('Description,Reviewed\n"Unclosed description,True\n', encoding="utf-8")
+        with self.assertRaises(main.CatalogueError):
+            main.load_rows(path)
 
     def test_csv_write_failure_keeps_original_and_removes_temp_file(self):
         path = self.write_csv()
@@ -126,11 +220,141 @@ class CatalogueTests(CatalogueTestCase):
 
 @unittest.skipIf(openpyxl is None, "Install the excel extra to test XLSX catalogues")
 class ExcelCatalogueTests(CatalogueTestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows replacement of an open workbook")
+    def test_windows_locked_workbook_preserves_original_and_can_be_retried(self):
+        path = self.write_workbook()
+        fields, rows = main.load_rows(path)
+        revision = main.catalogue_revision(path)
+        original = path.read_bytes()
+        rows[0]["Description"] = "Retry this correction"
+        with path.open("rb"):
+            with self.assertRaises(main.CatalogueError):
+                main.save_rows(path, fields, rows, expected_revision=revision)
+            self.assertEqual(path.read_bytes(), original)
+        self.assert_no_temp_files(path)
+        main.save_rows(path, fields, rows, expected_revision=revision)
+        self.assertEqual(main.load_rows(path)[1][0]["Description"], "Retry this correction")
+
+    def test_named_catalogue_is_read_and_saved_when_notes_tab_is_active(self):
+        path = self.write_workbook()
+        workbook = self.read_workbook(path)
+        workbook.active.title = "Catalogue"
+        workbook.active = 1
+        workbook.save(path)
+        fields, rows = main.load_rows(path)
+        self.assertEqual(rows[0]["Description"], "Original description")
+        rows[0]["Description"] = "Correction"
+        main.save_rows(path, fields, rows)
+        saved = self.read_workbook(path)
+        self.assertEqual(saved["Catalogue"]["A2"].value, "Correction")
+        self.assertEqual(saved.active.title, "Notes")
+        self.assertEqual(saved["Notes"]["A1"].value, "Other sheet stays intact")
+
+    def test_xlsx_string_booleans_are_recognized_and_invalid_values_rejected(self):
+        path = self.write_workbook()
+        workbook = self.read_workbook(path)
+        for value, expected in (("TRUE", "True"), ("0", "False"), (" false ", "False")):
+            with self.subTest(value=value):
+                workbook.active["C2"] = value
+                workbook.save(path)
+                self.assertEqual(main.load_rows(path)[1][0][main.REVIEWED_FIELD], expected)
+        workbook.active["C2"] = "maybe"
+        workbook.save(path)
+        with self.assertRaisesRegex(main.CatalogueError, "cell C2"):
+            main.load_rows(path)
+
+    def test_xlsx_native_encoded_links_and_formula_links_keep_their_values(self):
+        path = self.write_workbook()
+        workbook = self.read_workbook(path)
+        link = "Box%20Images/box%23one%25.png"
+        workbook.active["B2"].hyperlink = link
+        formula = '=HYPERLINK("Box Images/100%20.png","Box")'
+        workbook.active.append(["Formula image", formula, False])
+        workbook.save(path)
+        fields, rows = main.load_rows(path)
+        self.assertTrue(rows[0][main.XLSX_IMAGE_URL_KEY])
+        self.assertNotIn(main.XLSX_IMAGE_URL_KEY, rows[1])
+        self.assertEqual(main.resolve_image_path(self.folder, rows[0][main.IMAGE_LINK_FIELD], url_encoded=True), self.folder / "Box Images/box#one%.png")
+        main.save_rows(path, fields, rows)
+        saved = self.read_workbook(path)
+        self.assertEqual(saved.active["B2"].hyperlink.target, link)
+        self.assertEqual(saved.active["B3"].value, formula)
+        self.assertEqual(saved.active["B3"].data_type, "f")
+
+    def test_xlsx_allows_deleting_rows_with_remaining_literal_image_formulas(self):
+        path = self.write_workbook()
+        workbook = self.read_workbook(path)
+        formula = '=HYPERLINK("Box Images/second.png","Second")'
+        workbook.active.append(["Second", formula, False])
+        workbook.save(path)
+        fields, rows = main.load_rows(path)
+        main.save_rows(path, fields, rows[1:])
+        self.assertEqual(self.read_workbook(path).active["B2"].value, formula)
+
+    def test_xlsx_refuses_deletions_with_retained_formulas_or_ranges(self):
+        for feature in ("formula", "other_sheet_formula", "filter", "table", "merged", "named_range",
+                        "other_sheet_name", "other_sheet_chart", "chartsheet"):
+            with self.subTest(feature=feature):
+                path = self.write_workbook()
+                workbook = self.read_workbook(path)
+                sheet = workbook.active
+                sheet.append(["Second", "second.png", False])
+                if feature == "formula":
+                    sheet["D3"] = "=D2"
+                elif feature == "other_sheet_formula":
+                    workbook["Notes"]["A2"] = "=Sheet!D2"
+                elif feature == "filter":
+                    sheet.auto_filter.ref = "A1:H3"
+                elif feature == "table":
+                    from openpyxl.worksheet.table import Table
+                    sheet.add_table(Table(displayName="Records", ref="A1:C3"))
+                elif feature == "merged":
+                    sheet.merge_cells("D3:E3")
+                elif feature in ("named_range", "other_sheet_name"):
+                    from openpyxl.workbook.defined_name import DefinedName
+                    names = workbook.defined_names if feature == "named_range" else workbook["Notes"].defined_names
+                    names.add(DefinedName("RecordCount", attr_text="Sheet!$D$2"))
+                else:
+                    from openpyxl.chart import BarChart, Reference
+                    chart = BarChart()
+                    chart.add_data(Reference(sheet, min_col=4, min_row=2, max_row=3))
+                    destination = workbook["Notes"] if feature == "other_sheet_chart" else workbook.create_chartsheet("Chart")
+                    destination.add_chart(chart)
+                workbook.save(path)
+                original = path.read_bytes()
+                fields, rows = main.load_rows(path)
+                with self.assertRaisesRegex(main.CatalogueError, "formulas or spreadsheet ranges"):
+                    main.save_rows(path, fields, rows[1:])
+                self.assertEqual(path.read_bytes(), original)
+                self.assert_no_temp_files(path)
+                # Ordinary corrections are still allowed in these workbooks.
+                rows[0]["Description"] = "Correction"
+                main.save_rows(path, fields, rows)
+
+    def test_xlsx_protection_and_invalid_control_characters_fail_safely(self):
+        path = self.write_workbook()
+        workbook = self.read_workbook(path)
+        workbook.active.protection.sheet = True
+        workbook.save(path)
+        fields, rows = main.load_rows(path)
+        original = path.read_bytes()
+        with self.assertRaisesRegex(main.CatalogueError, "protected"):
+            main.save_rows(path, fields, rows)
+        self.assertEqual(path.read_bytes(), original)
+        workbook.active.protection.sheet = False
+        workbook.save(path)
+        original = path.read_bytes()
+        rows[0]["Description"] = "bad\x01text"
+        with self.assertRaisesRegex(main.CatalogueError, "control character"):
+            main.save_rows(path, fields, rows)
+        self.assertEqual(path.read_bytes(), original)
+        self.assert_no_temp_files(path)
+
     def write_workbook(self):
         path = self.folder / "catalogue.xlsx"
         workbook = openpyxl.Workbook()
         sheet = workbook.active
-        self.fields += ["Count", "Date", "Selected", "Formula", "Website"]
+        self.fields = ["Description", main.IMAGE_LINK_FIELD, main.REVIEWED_FIELD, "Count", "Date", "Selected", "Formula", "Website"]
         sheet.append(self.fields)
         sheet.append([
             "Original description", "box.png", False, 12, datetime(2024, 5, 6),

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import csv
 import inspect
 import tempfile
@@ -18,7 +19,9 @@ class TestPage:
     def __init__(self):
         self.controls = []
         self.dialogs = []
-        self.window = SimpleNamespace(destroy=AsyncMock(), prevent_close=False)
+        self.window = SimpleNamespace(destroy=AsyncMock(), center=AsyncMock(), prevent_close=False)
+        self.width = 1000
+        self.platform_brightness = ft.Brightness.LIGHT
 
     def add(self, control):
         self.controls.append(control)
@@ -52,8 +55,19 @@ class GuiTests(unittest.TestCase):
         self.folder = Path(self.temp.name)
         self.path = self.folder / "catalogue.csv"
         self.write_catalogue()
+        self.preferences = {}
+        self.get_preference = AsyncMock(side_effect=lambda key: self.preferences.get(key))
+        self.set_preference = AsyncMock(side_effect=self.remember_preference)
+        for method, mock in (("get", self.get_preference), ("set", self.set_preference)):
+            patcher = patch.object(ft.SharedPreferences, method, mock)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.page = TestPage()
-        main.page_main(self.page)
+        asyncio.run(main.page_main(self.page))
+
+    def remember_preference(self, key, value):
+        self.preferences[key] = value
+        return True
 
     def write_catalogue(self, reviewed=False, include_flags=True):
         fields = ["Description", main.IMAGE_LINK_FIELD, main.REVIEWED_FIELD]
@@ -224,6 +238,137 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.description().value, "First box")
         messages = [c.value for c in self.controls() if isinstance(c, ft.Text)]
         self.assertIn("Couldn't read this image", messages)
+
+    def test_window_is_centred_shown_and_remains_usable_if_centring_fails(self):
+        self.page.window.center.assert_awaited_once()
+        self.assertTrue(self.page.window.visible)
+        self.assertEqual((self.page.window.width, self.page.window.height), (1000, 650))
+        self.page = TestPage()
+        self.page.window.center.side_effect = RuntimeError("Window manager unavailable")
+        with self.assertLogs(main.logger, level="WARNING"):
+            asyncio.run(main.page_main(self.page))
+        self.assertTrue(self.page.window.visible)
+        self.open_folder()
+        self.assertEqual(self.description().value, "First box")
+
+    def test_theme_toggle_remembers_choice_without_losing_edits(self):
+        self.open_folder()
+        self.description().value = "Unsaved correction"
+        toggle = next(c for c in self.controls() if isinstance(c, ft.IconButton))
+        self.click(toggle)
+        self.assertEqual(self.page.theme_mode, ft.ThemeMode.DARK)
+        self.assertEqual(toggle.tooltip, "Switch to light mode")
+        self.assertEqual(self.preferences[main.THEME_PREFERENCE], "dark")
+        self.assertEqual(self.description().value, "Unsaved correction")
+        self.click(self.button("Next"))
+        self.assertEqual(self.page.dialogs[-1].title.value, "Unsaved changes")
+        self.choose("Cancel")
+        self.page = TestPage()
+        asyncio.run(main.page_main(self.page))
+        self.assertEqual(self.page.theme_mode, ft.ThemeMode.DARK)
+
+    def test_theme_uses_system_brightness_until_an_explicit_choice(self):
+        self.page.platform_brightness = ft.Brightness.DARK
+        self.page.on_platform_brightness_change(None)
+        toggle = next(c for c in self.controls() if isinstance(c, ft.IconButton))
+        self.assertEqual(toggle.tooltip, "Switch to light mode")
+        self.click(toggle)
+        self.assertEqual(self.page.theme_mode, ft.ThemeMode.LIGHT)
+        self.page.on_platform_brightness_change(None)
+        self.assertEqual(self.page.theme_mode, ft.ThemeMode.LIGHT)
+
+    def test_preference_failures_do_not_block_the_app_or_toggle(self):
+        self.get_preference.side_effect = RuntimeError("Unavailable storage")
+        self.page = TestPage()
+        with self.assertLogs(main.logger, level="WARNING"):
+            asyncio.run(main.page_main(self.page))
+        self.assertTrue(self.page.window.visible)
+        self.assertEqual(self.page.theme_mode, ft.ThemeMode.SYSTEM)
+        self.set_preference.side_effect = RuntimeError("Unavailable storage")
+        toggle = next(c for c in self.controls() if isinstance(c, ft.IconButton))
+        with self.assertLogs(main.logger, level="WARNING"):
+            self.click(toggle)
+        self.assertEqual(self.page.theme_mode, ft.ThemeMode.DARK)
+        self.assertFalse(toggle.disabled)
+        self.assertIn("this session", self.page.dialogs[-1].content.value)
+
+    def test_resizing_retains_unsaved_form_values_and_flags(self):
+        self.open_folder()
+        description = self.description()
+        description.value = "Unsaved correction"
+        self.click(self.button("+ Add flag").items[0])
+        for width in (640, 1000, 800):
+            self.page.on_resize(SimpleNamespace(width=width))
+            self.assertIs(self.description(), description)
+            self.assertEqual(description.value, "Unsaved correction")
+            chips = [c for c in self.controls() if isinstance(c, ft.Chip)]
+            self.assertEqual([c.data for c in chips], [main.DUPLICATE_FLAG])
+        self.click(self.button("Save"))
+        row = main.load_rows(self.path)[1][0]
+        self.assertEqual(row["Description"], "Unsaved correction")
+        self.assertEqual(row[main.FLAGS_FIELD], main.DUPLICATE_FLAG)
+
+    def test_failed_save_can_be_retried_without_losing_edits(self):
+        self.open_folder()
+        self.description().value = "Correction"
+        with patch("main.os.replace", side_effect=PermissionError("File locked")):
+            self.click(self.button("Save"))
+        self.assertEqual(self.description().value, "Correction")
+        self.choose("OK")
+        self.click(self.button("Save"))
+        self.assertEqual(main.load_rows(self.path)[1][0]["Description"], "Correction")
+
+    def test_uppercase_reviewed_and_selected_filename_are_shown_correctly(self):
+        self.write_catalogue(reviewed="TRUE")
+        renamed = self.path.with_name("Catalogue.CSV")
+        self.path.rename(renamed)
+        self.open_folder()
+        messages = [c.value for c in self.controls() if isinstance(c, ft.Text)]
+        self.assertIn("All 2 records reviewed", messages)
+        self.assertIn("Editing Catalogue.CSV", messages)
+
+    def test_batch_with_hyperlink_formulas_shows_seven_images_and_two_empty_records(self):
+        image = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        crops = self.folder / "Box Images"
+        crops.mkdir()
+        fields = ["Description", main.IMAGE_LINK_FIELD, main.REVIEWED_FIELD]
+        with self.path.open("w", newline="", encoding="utf-8") as output:
+            writer = csv.writer(output)
+            writer.writerow(fields)
+            for index in range(9):
+                link = ""
+                if index not in (1, 2):
+                    (crops / f"Box {index}.png").write_bytes(image)
+                    link = f'=HYPERLINK("Box Images/Box {index}.png","Box {index}")'
+                writer.writerow([f"Record {index}", link, "False"])
+        original_links = [row[main.IMAGE_LINK_FIELD] for row in main.load_rows(self.path)[1]]
+        self.open_folder()
+        image_count = empty_count = 0
+        for index in range(9):
+            previews = [c for c in self.controls() if isinstance(c, ft.Image)]
+            if previews:
+                image_count += 1
+                self.assertEqual(previews[0].src, image)
+            else:
+                empty_count += 1
+                self.assertIn("No image", [c.value for c in self.controls() if isinstance(c, ft.Text)])
+            if index < 8:
+                self.click(self.button("Next"))
+        self.assertEqual((image_count, empty_count), (7, 2))
+        self.description().value = "Correction"
+        self.click(self.button("Save"))
+        self.assertEqual([row[main.IMAGE_LINK_FIELD] for row in main.load_rows(self.path)[1]], original_links)
+
+    def test_empty_and_damaged_images_have_distinct_fallbacks(self):
+        self.path.write_text(self.path.read_text().replace("First box,,", "First box,crop.png,"))
+        image = self.folder / "crop.png"
+        image.touch()
+        self.open_folder()
+        self.assertTrue(any("file is empty" in (c.value or "") for c in self.controls() if isinstance(c, ft.Text)))
+        image.write_bytes(b"invalid image")
+        self.open_folder()
+        preview = next(c for c in self.controls() if isinstance(c, ft.Image))
+        self.assertIn("damaged or unsupported", preview.error_content.value)
 
 
 if __name__ == "__main__":
