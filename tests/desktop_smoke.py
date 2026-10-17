@@ -8,6 +8,7 @@ import asyncio
 import base64
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import flet as ft
@@ -88,8 +89,8 @@ def run():
             try:
                 previous_theme = await asyncio.wait_for(preferences.get(main.THEME_PREFERENCE), timeout=3)
                 preference_loaded = True
-                await main.page_main(page)
                 page.enable_screenshots = True
+                await main.page_main(page)
 
                 def controls():
                     return [child for control in page.controls for child in walk(control)]
@@ -97,12 +98,31 @@ def run():
                 def button(label):
                     return next(c for c in controls() if getattr(c, "content", None) == label)
 
+                def arrow(key):
+                    page.on_keyboard_event(SimpleNamespace(key=key, shift=False, ctrl=False, alt=False, meta=False))
+
                 for suffix, size in (("csv", (640, 480)), ("xlsx", (1000, 650))):
                     picker = AsyncMock(return_value=str(root / suffix))
                     with patch.object(ft.FilePicker, "get_directory_path", picker):
                         await button("Open outputs folder").on_click(None)
+                    await page.take_screenshot()
+                    if page.width < main.COMPACT_WIDTH:
+                        # The previous record may have left the compact view at
+                        # the image. Bring the field into view before focusing it.
+                        await page.controls[0].controls[1].scroll_to(offset=0)
+                        await page.take_screenshot()
                     description = next(c for c in controls() if isinstance(c, ft.TextField) and c.label == "Description")
+                    original_description = description.value
+                    arrow("Arrow Right")
+                    assert description.value == "Missing box"
+                    await page.take_screenshot()
+                    arrow("Arrow Left")
+                    assert description.value == original_description
+                    await page.take_screenshot()
                     await description.focus()
+                    await page.take_screenshot()
+                    arrow("Arrow Right")
+                    assert description.value == original_description
                     description.value = "Saved correction — café"
                     await resize_window(page, *size)
                     assert description.value == "Saved correction — café"
@@ -119,17 +139,32 @@ def run():
                         button("Next").on_click(None)
                         dialog = show_dialog.call_args.args[0]
                         assert dialog.title.value == "Unsaved changes"
+                        arrow("Arrow Right")
+                        assert description.value == "Saved correction — café"
+                        assert show_dialog.call_count == 1
                         next(c for c in dialog.actions if c.content == "Cancel").on_click(None)
                     button("Save").on_click(None)
                     path = main.find_catalogue(root / suffix)
                     assert main.load_rows(path)[1][0]["Description"] == description.value
+                    opened = asyncio.Event()
+
+                    async def record_open(selected):
+                        assert selected == path
+                        opened.set()
+
+                    # Verify the real GUI task path without opening an external
+                    # application or leaving a test workbook locked on Windows.
+                    with patch.object(main, "open_in_default_app", new=AsyncMock(side_effect=record_open)) as opener:
+                        button("Open catalogue").on_click(None)
+                        await asyncio.wait_for(opened.wait(), timeout=5)
+                        opener.assert_awaited_once_with(path)
                     images = 0
                     for index in range(3):
                         images += any(isinstance(c, ft.Image) for c in controls())
                         if index < 2:
                             button("Next").on_click(None)
                     assert images == 2
-                    print(f"PASS: native {suffix.upper()} save, preview, resize, zoom, and unsaved-edit checks", flush=True)
+                    print(f"PASS: native {suffix.upper()} save, preview, resize, zoom, arrows/focus, and catalogue-open checks", flush=True)
             finally:
                 try:
                     if preference_loaded:

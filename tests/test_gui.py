@@ -19,6 +19,7 @@ class TestPage:
     def __init__(self):
         self.controls = []
         self.dialogs = []
+        self.tasks = []
         self.window = SimpleNamespace(destroy=AsyncMock(), center=AsyncMock(), prevent_close=False)
         self.width = 1000
         self.platform_brightness = ft.Brightness.LIGHT
@@ -36,8 +37,14 @@ class TestPage:
     def pop_dialog(self):
         self.dialogs.pop()
 
-    def run_task(self, callback):
-        asyncio.run(callback())
+    def run_task(self, callback, *args):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(callback(*args))
+        task = loop.create_task(callback(*args))
+        self.tasks.append(task)
+        return task
 
 
 def walk_controls(control):
@@ -63,6 +70,10 @@ class GuiTests(unittest.TestCase):
             patcher = patch.object(ft.SharedPreferences, method, mock)
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.launch = AsyncMock()
+        patcher = patch.object(main, "open_in_default_app", self.launch)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.page = TestPage()
         asyncio.run(main.page_main(self.page))
 
@@ -104,6 +115,236 @@ class GuiTests(unittest.TestCase):
     def open_folder(self, folder=None):
         with patch.object(ft.FilePicker, "get_directory_path", new=AsyncMock(return_value=str(folder or self.folder))):
             self.click(self.button("Open outputs folder"))
+
+    def key(self, key, **modifiers):
+        values = dict(shift=False, ctrl=False, alt=False, meta=False)
+        values.update(modifiers)
+        self.page.on_keyboard_event(SimpleNamespace(key=key, **values))
+
+    def test_arrow_navigation_matches_buttons_and_stops_at_boundaries(self):
+        self.key("Arrow Left")
+        self.key("Arrow Right")
+        self.assertEqual(self.page.dialogs, [])
+        self.open_folder()
+        self.key("Arrow Left")
+        self.assertEqual(self.description().value, "First box")
+        self.key("Arrow Right")
+        self.assertEqual(self.description().value, "Second box")
+        self.key("Arrow Right")
+        self.assertEqual(self.description().value, "Second box")
+        self.key("Arrow Left")
+        self.assertEqual(self.description().value, "First box")
+
+    def test_arrows_leave_text_fields_and_modified_keys_alone(self):
+        self.open_folder()
+        field = self.description()
+        field.on_focus(SimpleNamespace(control=field))
+        self.key("Arrow Right")
+        self.assertEqual(field.value, "First box")
+        field.on_blur(SimpleNamespace(control=field))
+        for modifier in ("shift", "ctrl", "alt", "meta"):
+            self.key("Arrow Right", **{modifier: True})
+            self.assertEqual(field.value, "First box")
+        self.key("Arrow Up")
+        self.assertEqual(field.value, "First box")
+        self.key("Arrow Right")
+        self.assertEqual(field.value, "Second box")
+
+    def test_late_blur_from_another_field_does_not_enable_arrow_navigation(self):
+        self.path.write_text("Description,Other\nFirst box,One\nSecond box,Two\n", encoding="utf-8")
+        self.open_folder()
+        first = self.description()
+        second = next(c for c in self.controls() if isinstance(c, ft.TextField) and c.label == "Other")
+        first.on_focus(SimpleNamespace(control=first))
+        second.on_focus(SimpleNamespace(control=second))
+        first.on_blur(SimpleNamespace(control=first))
+        self.key("Arrow Right")
+        self.assertEqual(first.value, "First box")
+        second.on_blur(SimpleNamespace(control=second))
+        self.key("Arrow Right")
+        self.assertEqual(first.value, "Second box")
+
+    def test_arrows_use_unsaved_prompt_and_do_not_open_duplicate_confirmations(self):
+        self.open_folder()
+        self.description().value = "Unsaved correction"
+        self.key("Arrow Right")
+        confirmation = self.page.dialogs[-1]
+        self.key("Arrow Right")
+        self.key("Arrow Left")
+        self.assertEqual(self.page.dialogs, [confirmation])
+        self.assertEqual(self.description().value, "Unsaved correction")
+        self.choose("Cancel")
+        self.key("Arrow Right")
+        self.choose("Save")
+        self.assertEqual(self.description().value, "Second box")
+        self.assertEqual(main.load_rows(self.path)[1][0]["Description"], "Unsaved correction")
+
+    def test_arrow_navigation_stays_on_record_if_save_fails(self):
+        self.open_folder()
+        self.description().value = "Unsaved correction"
+        self.key("Arrow Right")
+        with patch.object(main, "save_rows", side_effect=main.CatalogueError("Disk full")):
+            self.choose("Save")
+        self.assertEqual(self.description().value, "Unsaved correction")
+        self.assertEqual(main.load_rows(self.path)[1][0]["Description"], "First box")
+
+    def test_arrows_do_not_change_the_record_targeted_by_a_discard_dialog(self):
+        self.open_folder()
+        self.click(self.button("Discard box"))
+        self.key("Arrow Right")
+        self.choose("Discard box")
+        self.assertEqual([row["Description"] for row in main.load_rows(self.path)[1]], ["Second box"])
+
+    def test_arrows_leave_the_flag_menu_alone(self):
+        self.open_folder()
+        menu = self.button("+ Add flag")
+        for close in (menu.on_cancel, menu.on_select):
+            menu.on_open(None)
+            self.key("Arrow Right")
+            self.assertEqual(self.description().value, "First box")
+            close(None)
+            self.key("Arrow Right")
+            self.assertEqual(self.description().value, "Second box")
+            self.key("Arrow Left")
+
+    def test_arrows_are_ignored_while_the_native_folder_picker_is_open(self):
+        self.open_folder()
+
+        async def exercise():
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def picker(**kwargs):
+                started.set()
+                await release.wait()
+                return None
+
+            with patch.object(ft.FilePicker, "get_directory_path", new=AsyncMock(side_effect=picker)):
+                task = asyncio.create_task(self.button("Open outputs folder").on_click(None))
+                await asyncio.wait_for(started.wait(), timeout=1)
+                self.key("Arrow Right")
+                self.assertEqual(self.description().value, "First box")
+                release.set()
+                await task
+            self.key("Arrow Right")
+            self.assertEqual(self.description().value, "Second box")
+
+        asyncio.run(exercise())
+
+    def test_open_catalogue_is_disabled_until_a_file_is_loaded(self):
+        self.assertTrue(self.button("Open catalogue").disabled)
+        self.click(self.button("Open catalogue"))
+        self.launch.assert_not_awaited()
+        self.open_folder()
+        self.assertFalse(self.button("Open catalogue").disabled)
+        self.click(self.button("Open catalogue"))
+        self.launch.assert_awaited_once_with(self.path)
+
+    def test_open_catalogue_handles_special_characters_and_xlsx_selection(self):
+        import openpyxl
+
+        folder = self.folder / "Review # café"
+        folder.mkdir()
+        path = folder / "Catalogue.xlsx"
+        workbook = openpyxl.Workbook()
+        workbook.active.append(["Description", main.REVIEWED_FIELD])
+        workbook.active.append(["Workbook record", False])
+        workbook.save(path)
+        workbook.close()
+        self.open_folder(folder)
+        self.click(self.button("Open catalogue"))
+        self.launch.assert_awaited_once_with(path)
+        self.assertIn("Catalogue.xlsx", self.button("Open catalogue").tooltip)
+
+    def test_open_saved_version_preserves_unsaved_gui_edits(self):
+        self.open_folder()
+        original = self.path.read_bytes()
+        self.description().value = "Unsaved correction"
+        self.click(self.button("Open catalogue"))
+        self.choose("Cancel")
+        self.launch.assert_not_awaited()
+        self.click(self.button("Open catalogue"))
+        self.choose("Open saved version")
+        self.launch.assert_awaited_once()
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(self.description().value, "Unsaved correction")
+        self.key("Arrow Right")
+        self.assertEqual(self.page.dialogs[-1].title.value, "Unsaved changes")
+
+    def test_save_and_open_writes_before_opening_and_failure_does_not_open(self):
+        self.open_folder()
+        self.description().value = "Correction"
+        self.click(self.button("Open catalogue"))
+        with patch.object(main, "save_rows", side_effect=main.CatalogueError("Disk full")):
+            self.choose("Save and open")
+        self.launch.assert_not_awaited()
+        self.assertEqual(self.description().value, "Correction")
+        self.choose("OK")
+
+        async def check_saved(*args, **kwargs):
+            self.assertEqual(main.load_rows(self.path)[1][0]["Description"], "Correction")
+
+        self.launch.side_effect = check_saved
+        self.click(self.button("Open catalogue"))
+        self.choose("Save and open")
+        self.launch.assert_awaited_once()
+        self.key("Arrow Right")
+        self.assertEqual(self.description().value, "Second box")
+
+    def test_missing_file_or_application_has_a_clear_error_and_keeps_the_form(self):
+        self.open_folder()
+        self.launch.side_effect = OSError("No application is associated with this file")
+        with self.assertLogs(main.logger, level="WARNING"):
+            self.click(self.button("Open catalogue"))
+        self.assertIn("default app", self.page.dialogs[-1].content.value)
+        self.choose("OK")
+        self.launch.reset_mock()
+        self.path.unlink()
+        self.click(self.button("Open catalogue"))
+        self.assertIn("could not be found", self.page.dialogs[-1].content.value)
+        self.launch.assert_not_awaited()
+        self.assertEqual(self.description().value, "First box")
+        self.assertFalse(self.button("Open catalogue").disabled)
+
+    def test_open_failure_keeps_unsaved_edits_and_can_be_retried(self):
+        self.open_folder()
+        self.description().value = "Unsaved correction"
+        self.launch.side_effect = RuntimeError("No association")
+        self.click(self.button("Open catalogue"))
+        with self.assertLogs(main.logger, level="WARNING"):
+            self.choose("Open saved version")
+        self.assertEqual(self.description().value, "Unsaved correction")
+        self.assertFalse(self.button("Open catalogue").disabled)
+        self.choose("OK")
+        self.launch.side_effect = None
+        self.click(self.button("Open catalogue"))
+        self.choose("Open saved version")
+        self.assertEqual(self.launch.await_count, 2)
+
+    def test_repeated_open_clicks_do_not_launch_multiple_apps(self):
+        self.open_folder()
+
+        async def exercise():
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def hold(*args, **kwargs):
+                started.set()
+                await release.wait()
+
+            self.launch.side_effect = hold
+            self.click(self.button("Open catalogue"))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            self.assertTrue(self.button("Open catalogue").disabled)
+            self.click(self.button("Open catalogue"))
+            self.key("Arrow Right")
+            self.assertEqual(self.description().value, "First box")
+            release.set()
+            await asyncio.gather(*self.page.tasks)
+            self.launch.assert_awaited_once()
+            self.assertFalse(self.button("Open catalogue").disabled)
+
+        asyncio.run(exercise())
 
     def test_navigation_still_prompts_and_saves(self):
         self.open_folder()

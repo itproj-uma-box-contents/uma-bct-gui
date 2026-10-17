@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import re
+import sys
 import tempfile
 from bisect import bisect_left
 from collections.abc import Callable
@@ -130,6 +131,29 @@ def parse_flags(value: str | None) -> list[str]:
 
 class CatalogueError(Exception):
     """A catalogue file can't be read or written; the message is user-facing."""
+
+
+async def open_in_default_app(path: Path) -> None:
+    """Ask the desktop to open a file, reporting immediate launch failures."""
+    filename = str(path.resolve())
+    if sys.platform == "win32":
+        await asyncio.to_thread(os.startfile, filename)
+        return
+    opener = "/usr/bin/open" if sys.platform == "darwin" else "xdg-open"
+    process = await asyncio.create_subprocess_exec(
+        opener, filename,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        returncode = await asyncio.wait_for(process.wait(), timeout=5)
+    except TimeoutError:
+        # Some Linux file associations keep the opener running with the app.
+        # Leave that app running and allow the reviewer to keep using the GUI.
+        return
+    if returncode != 0:
+        raise OSError(f"The system file opener exited with status {returncode}.")
 
 
 def resolve_image_path(folder: Path, reference: str, *, url_encoded: bool = False) -> Path | None:
@@ -553,12 +577,34 @@ async def page_main(page: ft.Page) -> None:
     form_fields: list[str] = []
     current_index = 0
     text_fields: dict[str, ft.TextField] = {}
+    focused_text_field: ft.TextField | None = None
+    modal_dialogs: list[ft.AlertDialog] = []
+    flag_menu_open = False
+    folder_picker_open = False
+    catalogue_opening = False
     # Flet otherwise treats newly built controls with identical contents as the
     # old controls, leaving Python references detached after a record/folder change.
     control_keys = count()
 
     file_picker = ft.FilePicker()
     preferences = ft.SharedPreferences()
+
+    def on_field_focus(e: ft.Event) -> None:
+        nonlocal focused_text_field
+        focused_text_field = e.control
+
+    def on_field_blur(e: ft.Event) -> None:
+        nonlocal focused_text_field
+        if focused_text_field is e.control:
+            focused_text_field = None
+
+    def on_flag_menu_open(e: ft.Event) -> None:
+        nonlocal flag_menu_open
+        flag_menu_open = True
+
+    def on_flag_menu_close(e: ft.Event) -> None:
+        nonlocal flag_menu_open
+        flag_menu_open = False
 
     def update_theme_button() -> None:
         dark = page.theme_mode == ft.ThemeMode.DARK or (
@@ -636,13 +682,17 @@ async def page_main(page: ft.Page) -> None:
         swatch = ft.Container(width=12, height=12, bgcolor=bgcolor, border_radius=3)
 
         def pick(e: ft.Event) -> None:
+            on_flag_menu_close(e)
             flags_row.controls.append(make_flag_chip(flag))
             refresh_add_flag_menu()
             page.update()
 
         return ft.PopupMenuItem(content=ft.Row([swatch, ft.Text(flag)], spacing=8), on_click=pick)
 
-    add_flag_btn = ft.PopupMenuButton(content="+ Add flag")
+    add_flag_btn = ft.PopupMenuButton(
+        content="+ Add flag", on_open=on_flag_menu_open,
+        on_cancel=on_flag_menu_close, on_select=on_flag_menu_close,
+    )
 
     def refresh_add_flag_menu() -> None:
         """Offer only flags not already applied to this record."""
@@ -704,6 +754,10 @@ async def page_main(page: ft.Page) -> None:
         ft.Colors.PRIMARY_CONTAINER,
         ft.Colors.ON_PRIMARY_CONTAINER,
     )
+    open_catalogue_btn = action_button(
+        "Open catalogue", ft.Icons.OPEN_IN_NEW,
+        ft.Colors.PRIMARY_CONTAINER, ft.Colors.ON_PRIMARY_CONTAINER,
+    )
     discard_changes_btn = action_button(
         "Discard changes",
         ft.Icons.CLOSE,
@@ -734,6 +788,8 @@ async def page_main(page: ft.Page) -> None:
         ft.Colors.PRIMARY_CONTAINER,
         ft.Colors.ON_PRIMARY_CONTAINER,
     )
+    prev_btn.tooltip = "Previous record (Left arrow, outside text fields)"
+    next_btn.tooltip = "Next record (Right arrow, outside text fields)"
     view_records_btn = ft.TextButton("View records", on_click=lambda e: go_to(0), visible=False)
 
     def set_controls_enabled(enabled: bool) -> None:
@@ -774,6 +830,8 @@ async def page_main(page: ft.Page) -> None:
             content=ft.Text(message),
             actions=[ft.TextButton(label, on_click=make_handler(cb)) for label, cb in options],
         )
+        modal_dialogs[:] = [item for item in modal_dialogs if item.open]
+        modal_dialogs.append(dialog)
         page.show_dialog(dialog)
 
     def show_error(title: str, message: str) -> None:
@@ -818,6 +876,11 @@ async def page_main(page: ft.Page) -> None:
         catalogue_text.value = f"Editing {catalogue_path.name}" if catalogue_path else ""
         catalogue_text.tooltip = str(catalogue_path) if catalogue_path else None
         catalogue_text.visible = catalogue_path is not None
+        open_catalogue_btn.disabled = catalogue_path is None or catalogue_opening
+        open_catalogue_btn.tooltip = (
+            f"Open {catalogue_path.name} in your default spreadsheet app"
+            if catalogue_path else "Open the selected catalogue in your default spreadsheet app"
+        )
         if catalogue_path is None:
             status_text.value = "Open an outputs folder to begin"
         elif not rows:
@@ -912,7 +975,7 @@ async def page_main(page: ft.Page) -> None:
 
     def load_folder(dir_path: Path) -> None:
         nonlocal outputs_dir, catalogue_path, fieldnames, rows, form_fields, current_index
-        nonlocal loaded_revision
+        nonlocal loaded_revision, focused_text_field
 
         try:
             candidate = find_catalogue(dir_path)
@@ -930,6 +993,7 @@ async def page_main(page: ft.Page) -> None:
         catalogue_path = candidate
         loaded_revision = revision
         fieldnames, rows = loaded_fieldnames, loaded_rows
+        focused_text_field = None
         for name in (FLAGS_FIELD, REVIEWED_FIELD):
             if name not in fieldnames:
                 fieldnames.append(name)
@@ -951,6 +1015,8 @@ async def page_main(page: ft.Page) -> None:
                 min_lines=3 if name in MULTILINE_FIELDS else 1,
                 max_lines=6 if name in MULTILINE_FIELDS else 1,
                 read_only=name in READ_ONLY_FIELDS,
+                on_focus=on_field_focus,
+                on_blur=on_field_blur,
             )
         form_column.controls = [*text_fields.values(), flags_block, reviewed_checkbox]
         if text_fields:
@@ -963,6 +1029,10 @@ async def page_main(page: ft.Page) -> None:
         refresh()
 
     async def on_open_folder(e: ft.Event) -> None:
+        nonlocal folder_picker_open
+        if folder_picker_open:
+            return
+        folder_picker_open = True
         try:
             selected = await file_picker.get_directory_path(
                 dialog_title="Select outputs folder"
@@ -970,6 +1040,8 @@ async def page_main(page: ft.Page) -> None:
         except Exception as ex:
             show_error("Couldn't open folder picker", str(ex))
             return
+        finally:
+            folder_picker_open = False
         if selected:
             confirm_unsaved_changes("opening another folder", lambda: load_folder(Path(selected)))
 
@@ -1018,6 +1090,49 @@ async def page_main(page: ft.Page) -> None:
             page.update()
             page.show_dialog(ft.SnackBar(content=ft.Text("Saved"), duration=1500))
 
+    async def launch_catalogue(path: Path) -> None:
+        nonlocal catalogue_opening
+        try:
+            if not path.is_file():
+                show_error("Couldn't open catalogue", f"{path.name} could not be found. Check the folder and try again.")
+                return
+            await asyncio.wait_for(open_in_default_app(path), timeout=10)
+        except Exception:
+            logger.warning("Could not open catalogue %s", path, exc_info=True)
+            show_error(
+                "Couldn't open catalogue",
+                f"Could not open {path.name}. Check that the folder is available and a default app for {path.suffix} files is set, then try again.",
+            )
+        finally:
+            catalogue_opening = False
+            update_status()
+            page.update()
+
+    def on_open_catalogue(e: ft.Event) -> None:
+        if catalogue_path is None or catalogue_opening or any(dialog.open for dialog in modal_dialogs):
+            return
+        path = catalogue_path
+
+        def open_saved() -> None:
+            nonlocal catalogue_opening
+            catalogue_opening = True
+            update_status()
+            page.update()
+            page.run_task(launch_catalogue, path)
+
+        def save_and_open() -> None:
+            if save_current():
+                open_saved()
+
+        if has_unsaved_changes():
+            ask(
+                "Unsaved changes",
+                f"Save your edits before opening {path.name}? Opening the saved version keeps your unsaved edits in this window.",
+                [("Cancel", None), ("Open saved version", open_saved), ("Save and open", save_and_open)],
+            )
+        else:
+            open_saved()
+
     def on_discard_changes(e: ft.Event) -> None:
         ask(
             "Discard changes?",
@@ -1049,7 +1164,19 @@ async def page_main(page: ft.Page) -> None:
             f"going to the {'next' if step > 0 else 'previous'} box", lambda: go_to(target)
         )
 
+    def on_keyboard(e: ft.KeyboardEvent) -> None:
+        step = {"Arrow Left": -1, "Arrow Right": 1}.get(e.key)
+        if step is None or e.shift or e.ctrl or e.alt or e.meta:
+            return
+        if focused_text_field is not None or flag_menu_open or folder_picker_open or catalogue_opening:
+            return
+        if any(dialog.open for dialog in modal_dialogs):
+            return
+        navigate(step)
+
     open_folder_btn.on_click = on_open_folder
+    open_catalogue_btn.on_click = on_open_catalogue
+    page.on_keyboard_event = on_keyboard
     discard_changes_btn.on_click = on_discard_changes
     discard_box_btn.on_click = on_discard_box
     save_btn.on_click = on_save
@@ -1064,7 +1191,10 @@ async def page_main(page: ft.Page) -> None:
     )
     top_bar = ft.Row(
         controls=[
-            ft.Row(controls=[open_folder_btn, status_text, view_records_btn], spacing=16, wrap=True, expand=True),
+            ft.Row(
+                controls=[open_folder_btn, open_catalogue_btn, status_text, view_records_btn],
+                spacing=16, wrap=True, expand=True,
+            ),
             theme_control,
         ],
         vertical_alignment=ft.CrossAxisAlignment.START,

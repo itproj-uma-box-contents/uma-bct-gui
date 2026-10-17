@@ -26,10 +26,10 @@ uv sync --locked
 
 The first launch may download the native Flet client from GitHub if it is not already available locally. Complete that first launch while online before using the app offline.
 
-On Ubuntu desktop, the native folder picker also needs Zenity:
+On Ubuntu desktop, the native folder picker needs Zenity, and opening a catalogue in another app uses `xdg-open` from `xdg-utils`:
 
 ```
-sudo apt install zenity
+sudo apt install zenity xdg-utils
 ```
 
 ## Usage
@@ -55,6 +55,10 @@ The sun/moon button switches between light and dark mode. The first launch follo
 Unsaved changes are checked before moving between records, opening another folder, or closing the window. Failed saves keep your edits available to retry. If another program changes the catalogue, the app asks you to reopen the folder rather than overwrite those changes.
 
 Use the image's Zoom in, Zoom out and Reset / Fit buttons, or scroll to zoom and drag to pan. The status shows reviewed and remaining counts. If every record is reviewed when a folder opens, use "View records" to revisit them.
+
+Use the **Left/Right arrow keys** to move through records in the same order as Prev/Next, including records without images. Navigation stops at the first and last records. Arrows keep their normal editing behavior while a text field is focused; modified arrow shortcuts and keys used in menus, dialogs, or the folder picker do not navigate records. Unsaved edits still trigger the usual save prompt.
+
+The **Open catalogue** button opens the active CSV or XLSX in your system's default app. If you have unsaved edits, choose **Save and open**, **Open saved version**, or **Cancel**. Opening the saved version keeps unsaved GUI edits available. A failed save prevents opening, and an opening failure leaves the form available to retry. Close the spreadsheet app before continuing GUI edits; external file changes still require reopening the folder.
 
 Image links can be relative paths, local file URLs, native Excel hyperlinks, or `HYPERLINK` formulas with literal file paths. Keep the catalogue and its `Box Images` directory together when moving a batch between computers. Windows path separators are accepted. An absolute path to a drive on another computer cannot be relocated automatically. Missing-box suggestions can legitimately have no image.
 
@@ -86,6 +90,6 @@ To run the separate native rendering smoke test on a machine with a desktop sess
 uv run --locked python tests/desktop_smoke.py
 ```
 
-It opens and closes a test window, uses disposable CSV/XLSX fixtures, restores the original theme preference, and checks resizing, scrolling, image methods, editing, and saves. The native folder picker is stubbed in this test and needs the manual check below.
+It opens and closes a test window, uses disposable CSV/XLSX fixtures, restores the original theme preference, and checks resizing, scrolling, image methods, arrow-handler behavior, native field focus, editing, saves, and the catalogue-open action. The native folder picker and external application opener are stubbed in this test and need the manual checks below.
 
 Desktop verification targets Windows 11, Intel and Apple Silicon Macs, and Ubuntu desktop. The repeatable manual checks and recorded results are in [desktop verification](docs/desktop-verification.md).
