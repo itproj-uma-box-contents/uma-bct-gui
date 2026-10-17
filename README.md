@@ -90,6 +90,6 @@ To run the separate native rendering smoke test on a machine with a desktop sess
 uv run --locked python tests/desktop_smoke.py
 ```
 
-It opens and closes a test window, uses disposable CSV/XLSX fixtures, restores the original theme preference, and checks resizing, scrolling, image methods, arrow-handler behavior, native field focus, editing, saves, and the catalogue-open action. The native folder picker and external application opener are stubbed in this test and need the manual checks below.
+It opens and closes test windows using disposable CSV/XLSX fixtures. It first checks normal startup without screenshot support, then checks resizing, scrolling, image methods, arrow-handler behavior, native field focus, editing, saves, and the catalogue-open action. It restores the original theme preference. The native folder picker and external application opener are stubbed in this test and need the manual checks below.
 
 Desktop verification targets Windows 11, Intel and Apple Silicon Macs, and Ubuntu desktop. The repeatable manual checks and recorded results are in [desktop verification](docs/desktop-verification.md).

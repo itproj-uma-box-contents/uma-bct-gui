@@ -82,15 +82,33 @@ def run():
         root = Path(temporary)
         create_batches(root)
 
+        async def check_startup(page):
+            # Exercise production startup without screenshot support or a native
+            # preferences call from the test before page_main().
+            try:
+                async with asyncio.timeout(30):
+                    await main.page_main(page)
+                    controls = [child for control in page.controls for child in walk(control)]
+                    open_folder = next(c for c in controls if getattr(c, "content", None) == "Open outputs folder")
+                    with patch.object(ft.FilePicker, "get_directory_path", AsyncMock(return_value=str(root / "csv"))):
+                        await open_folder.on_click(None)
+                    controls = [child for control in page.controls for child in walk(control)]
+                    description = next(c for c in controls if isinstance(c, ft.TextField) and c.label == "Description")
+                    await description.focus()
+                    assert description.value == "Café, archive\nSecond line"
+                    print("PASS: normal native startup and loaded field focus without screenshot support", flush=True)
+            finally:
+                await asyncio.wait_for(page.window.destroy(), timeout=3)
+            completed.append("startup")
+
         async def check_window(page):
             preferences = ft.SharedPreferences()
             previous_theme = None
             preference_loaded = False
             try:
+                await main.page_main(page)
                 previous_theme = await asyncio.wait_for(preferences.get(main.THEME_PREFERENCE), timeout=3)
                 preference_loaded = True
-                page.enable_screenshots = True
-                await main.page_main(page)
 
                 def controls():
                     return [child for control in page.controls for child in walk(control)]
@@ -179,15 +197,21 @@ def run():
                             raise RuntimeError("Could not restore the original theme preference")
                 finally:
                     await asyncio.wait_for(page.window.destroy(), timeout=3)
-            completed.append(True)
+            completed.append("review")
 
         async def check(page):
             async with asyncio.timeout(60):
                 await check_window(page)
 
-        ft.run(check, view=ft.AppView.FLET_APP_HIDDEN)
+        def configure_page(page):
+            # Enabling screenshots changes the native page wrapper. Configure it
+            # before registration so live controls keep the same parent.
+            page.enable_screenshots = True
+
+        ft.run(check_startup, view=ft.AppView.FLET_APP_HIDDEN)
+        ft.run(check, view=ft.AppView.FLET_APP_HIDDEN, before_main=configure_page)
     # Flet reports callback exceptions itself, so make failure visible to a shell.
-    if not completed:
+    if completed != ["startup", "review"]:
         raise SystemExit(1)
 
 
