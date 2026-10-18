@@ -2,6 +2,7 @@ import asyncio
 import base64
 import csv
 import inspect
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +23,7 @@ class TestPage:
         self.tasks = []
         self.window = SimpleNamespace(destroy=AsyncMock(), center=AsyncMock(), prevent_close=False)
         self.width = 1000
+        self.height = 618
         self.platform_brightness = ft.Brightness.LIGHT
 
     def add(self, control):
@@ -99,7 +101,7 @@ class GuiTests(unittest.TestCase):
         return next(c for c in self.controls() if getattr(c, "content", None) == label)
 
     def description(self):
-        return next(c for c in self.controls() if isinstance(c, ft.TextField) and c.label == "Description")
+        return next(c for c in self.controls() if isinstance(c, ft.TextField) and getattr(c.label, "value", c.label) == "Description")
 
     def click(self, control):
         handler = control.on_click
@@ -154,7 +156,7 @@ class GuiTests(unittest.TestCase):
         self.path.write_text("Description,Other\nFirst box,One\nSecond box,Two\n", encoding="utf-8")
         self.open_folder()
         first = self.description()
-        second = next(c for c in self.controls() if isinstance(c, ft.TextField) and c.label == "Other")
+        second = next(c for c in self.controls() if isinstance(c, ft.TextField) and getattr(c.label, "value", c.label) == "Other")
         first.on_focus(SimpleNamespace(control=first))
         second.on_focus(SimpleNamespace(control=second))
         first.on_blur(SimpleNamespace(control=first))
@@ -195,6 +197,42 @@ class GuiTests(unittest.TestCase):
         self.choose("Discard box")
         self.assertEqual([row["Description"] for row in main.load_rows(self.path)[1]], ["Second box"])
 
+    def test_queued_button_clicks_do_not_change_the_record_targeted_by_a_modal(self):
+        self.open_folder()
+        self.click(self.button("Discard box"))
+        confirmation = self.page.dialogs[-1]
+        for label in ("Next", "Prev", "View records", "Save", "Discard box", "Discard changes", "Open catalogue"):
+            self.click(self.button(label))
+        with patch.object(ft.FilePicker, "get_directory_path", new=AsyncMock()) as picker:
+            self.click(self.button("Open outputs folder"))
+            picker.assert_not_awaited()
+        self.assertEqual(self.page.dialogs, [confirmation])
+        self.assertEqual(self.description().value, "First box")
+        self.launch.assert_not_awaited()
+        self.choose("Discard box")
+        self.assertEqual([row["Description"] for row in main.load_rows(self.path)[1]], ["Second box"])
+
+    def test_repeated_close_events_share_one_unsaved_confirmation(self):
+        self.open_folder()
+        self.description().value = "Unsaved correction"
+        event = SimpleNamespace(type=ft.WindowEventType.CLOSE)
+        self.page.window.on_event(event)
+        confirmation = self.page.dialogs[-1]
+        self.page.window.on_event(event)
+        self.page.window.on_event(event)
+        self.assertEqual(self.page.dialogs, [confirmation])
+        self.choose("Cancel")
+        self.page.window.destroy.assert_not_awaited()
+        self.assertEqual(self.description().value, "Unsaved correction")
+
+    def test_queued_close_during_discard_confirmation_does_not_close_the_window(self):
+        self.open_folder()
+        self.click(self.button("Discard box"))
+        self.page.window.on_event(SimpleNamespace(type=ft.WindowEventType.CLOSE))
+        self.page.window.destroy.assert_not_awaited()
+        self.choose("Cancel")
+        self.assertEqual(self.description().value, "First box")
+
     def test_arrows_leave_the_flag_menu_alone(self):
         self.open_folder()
         menu = self.button("+ Add flag")
@@ -230,6 +268,27 @@ class GuiTests(unittest.TestCase):
             self.assertEqual(self.description().value, "Second box")
 
         asyncio.run(exercise())
+
+    def test_folder_picker_does_not_replace_a_modal_that_arrives_while_waiting(self):
+        self.open_folder()
+        other = self.folder / "other"
+        other.mkdir()
+        (other / "catalogue.csv").write_text("Description\nOther record\n", encoding="utf-8")
+        handler = self.button("Open outputs folder").on_click
+        show_error = inspect.getclosurevars(handler).nonlocals["show_error"]
+
+        async def picker(**kwargs):
+            # Model an asynchronous error arriving while the native picker is open.
+            show_error("Delayed error", "Keep this message available")
+            return str(other)
+
+        with patch.object(ft.FilePicker, "get_directory_path", new=AsyncMock(side_effect=picker)):
+            self.click(self.button("Open outputs folder"))
+        self.assertEqual(self.description().value, "First box")
+        self.assertEqual(self.page.dialogs[-1].title.value, "Delayed error")
+        self.choose("OK")
+        self.open_folder(other)
+        self.assertEqual(self.description().value, "Other record")
 
     def test_open_catalogue_is_disabled_until_a_file_is_loaded(self):
         self.assertTrue(self.button("Open catalogue").disabled)
@@ -384,6 +443,18 @@ class GuiTests(unittest.TestCase):
         self.choose("Discard changes")
         self.assertEqual(self.description().value, "First box")
 
+    def test_long_error_details_can_scroll_without_losing_unsaved_edits(self):
+        self.open_folder()
+        self.description().value = "Unsaved correction"
+        message = "Long error detail. " * 250
+        with patch.object(main, "save_rows", side_effect=main.CatalogueError(message)):
+            self.click(self.button("Save"))
+        dialog = self.page.dialogs[-1]
+        self.assertTrue(dialog.scrollable)
+        self.assertEqual(dialog.content.value, message)
+        self.choose("OK")
+        self.assertEqual(self.description().value, "Unsaved correction")
+
     def test_failed_discard_keeps_both_records(self):
         self.open_folder()
         self.click(self.button("Discard box"))
@@ -412,6 +483,49 @@ class GuiTests(unittest.TestCase):
         self.open_folder(other)
         self.assertEqual(self.description().value, "First box")
         self.assertIsInstance(self.page.dialogs[-1], ft.AlertDialog)
+
+    def test_malformed_workbook_errors_preserve_the_existing_dirty_form(self):
+        import openpyxl
+
+        self.open_folder()
+        self.description().value = "Unsaved correction"
+        other = self.folder / "other"
+        other.mkdir()
+        (other / "catalogue.xlsx").write_bytes(b"Malformed workbook")
+        for error in (TypeError("Invalid sheet ID"), IndexError("Invalid style index")):
+            with self.subTest(error=error):
+                self.open_folder(other)
+                with patch.object(openpyxl, "load_workbook", side_effect=error):
+                    self.choose("Don't save")
+                self.assertEqual(self.page.dialogs[-1].title.value, "Couldn't open folder")
+                self.assertEqual(self.description().value, "Unsaved correction")
+                self.choose("OK")
+
+    def test_oversized_workbook_edit_remains_dirty_until_corrected_and_retried(self):
+        import openpyxl
+
+        other = self.folder / "excel"
+        other.mkdir()
+        path = other / "catalogue.xlsx"
+        workbook = openpyxl.Workbook()
+        workbook.active.append(["Description", main.REVIEWED_FIELD])
+        workbook.active.append(["Original description", False])
+        workbook.save(path)
+        workbook.close()
+        self.open_folder(other)
+        original = path.read_bytes()
+        self.description().value = "x" * 32_768
+        self.click(self.button("Save"))
+        self.assertIn("32,767", self.page.dialogs[-1].content.value)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(len(self.description().value), 32_768)
+        self.choose("OK")
+        self.page.window.on_event(SimpleNamespace(type=ft.WindowEventType.CLOSE))
+        self.assertEqual(self.page.dialogs[-1].title.value, "Unsaved changes")
+        self.choose("Cancel")
+        self.description().value = "Shortened correction"
+        self.click(self.button("Save"))
+        self.assertEqual(main.load_rows(path)[1][0]["Description"], "Shortened correction")
 
     def test_added_flags_get_saved_when_header_was_missing(self):
         self.write_catalogue(include_flags=False)
@@ -456,6 +570,23 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(self.description().disabled)
         for label in ("Save", "Discard box", "Prev", "Next"):
             self.assertTrue(self.button(label).disabled)
+        with patch.object(main, "save_rows") as save:
+            for label in ("Save", "Discard box", "Discard changes"):
+                self.click(self.button(label))
+            save.assert_not_called()
+        self.assertEqual(self.page.dialogs, [])
+
+    def test_save_and_discard_ignore_queued_clicks_without_an_active_record(self):
+        for state in ("no catalogue", "all reviewed"):
+            with self.subTest(state=state):
+                if state == "all reviewed":
+                    self.write_catalogue(reviewed=True)
+                    self.open_folder()
+                with patch.object(main, "save_rows") as save:
+                    for label in ("Save", "Discard box", "Discard changes"):
+                        self.click(self.button(label))
+                    save.assert_not_called()
+                self.assertEqual(self.page.dialogs, [])
 
     def test_reviewed_catalogue_has_clear_completion_and_revisit_action(self):
         self.write_catalogue(reviewed=True)
@@ -480,6 +611,17 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.description().value, "First box")
         messages = [c.value for c in self.controls() if isinstance(c, ft.Text)]
         self.assertIn("Couldn't read this image", messages)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "Named pipes require POSIX")
+    def test_fifo_crop_is_rejected_without_opening_or_blocking(self):
+        self.path.write_text(self.path.read_text().replace("First box,,", "First box,crop.png,"))
+        os.mkfifo(self.folder / "crop.png")
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("Do not read a FIFO")) as read:
+            self.open_folder()
+            read.assert_not_called()
+        self.assertEqual(self.description().value, "First box")
+        messages = [c.value for c in self.controls() if isinstance(c, ft.Text)]
+        self.assertIn("Couldn't read this image: the path is not a regular file", messages)
 
     def test_window_is_centred_shown_and_remains_usable_if_centring_fails(self):
         self.page.window.center.assert_awaited_once()
@@ -585,6 +727,58 @@ class GuiTests(unittest.TestCase):
         row = main.load_rows(self.path)[1][0]
         self.assertEqual(row["Description"], "Unsaved correction")
         self.assertEqual(row[main.FLAGS_FIELD], main.DUPLICATE_FLAG)
+
+    def test_short_workspaces_scroll_all_content_without_changing_live_parents(self):
+        self.open_folder()
+        description = self.description()
+        description.value = "Unsaved correction"
+        self.click(self.button("+ Add flag").items[0])
+        root = self.page.controls[0]
+        header, content, footer = root.controls
+        body = content.controls[0]
+        form, image = body.controls
+        for width, height in ((640, 288), (1000, 288), (640, 240), (1000, 618), (640, 448)):
+            with self.subTest(width=width, height=height):
+                self.page.on_resize(SimpleNamespace(width=width, height=height))
+                self.assertIs(root.controls[0], header)
+                self.assertIs(root.controls[1], content)
+                self.assertIs(root.controls[2], footer)
+                self.assertIs(content.controls[0], body)
+                self.assertIs(body.controls[0], form)
+                self.assertIs(body.controls[1], image)
+                self.assertIs(self.description(), description)
+                self.assertEqual(description.value, "Unsaved correction")
+                self.assertEqual(root.scroll, ft.ScrollMode.AUTO if height < 400 else None)
+                if height < 400:
+                    self.assertIsNone(content.expand)
+                    self.assertTrue(content.tight)
+                    self.assertIsNone(content.scroll)
+                    self.assertIsNone(form.scroll)
+                    self.assertIsNone(body.expand)
+                else:
+                    self.assertTrue(content.expand)
+                    self.assertEqual(content.scroll, ft.ScrollMode.AUTO if width < 850 else None)
+        self.click(self.button("Save"))
+        row = main.load_rows(self.path)[1][0]
+        self.assertEqual(row["Description"], "Unsaved correction")
+        self.assertEqual(row[main.FLAGS_FIELD], main.DUPLICATE_FLAG)
+
+    def test_long_field_names_use_one_line_and_expose_the_full_name(self):
+        name = "Long catalogue column " * 15
+        with self.path.open("w", newline="", encoding="utf-8") as output:
+            writer = csv.writer(output)
+            writer.writerow([name, "Description"])
+            writer.writerow(["Original value", "First box"])
+        self.open_folder()
+        field = next(c for c in self.controls() if isinstance(c, ft.TextField) and getattr(c.label, "value", c.label) == name)
+        self.assertIsInstance(field.label, ft.Text)
+        self.assertTrue(field.label.no_wrap)
+        self.assertEqual(field.label.max_lines, 1)
+        self.assertEqual(field.label.overflow, ft.TextOverflow.ELLIPSIS)
+        self.assertEqual(field.tooltip, name)
+        field.value = "Corrected value"
+        self.click(self.button("Save"))
+        self.assertEqual(main.load_rows(self.path)[1][0][name], "Corrected value")
 
     def test_failed_save_can_be_retried_without_losing_edits(self):
         self.open_folder()

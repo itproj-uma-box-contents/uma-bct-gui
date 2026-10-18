@@ -5,8 +5,10 @@ import csv
 import errno
 import hashlib
 import logging
+import math
 import os
 import re
+import stat
 import sys
 import tempfile
 from bisect import bisect_left
@@ -82,6 +84,11 @@ DEFAULT_FLAG_COLOR = (ft.Colors.GREY_400, ft.Colors.BLACK)
 
 # Catalogue formats the CLI can produce.
 CATALOGUE_EXTENSIONS = (".csv", ".xlsx")
+# Set the process-wide parser limit once, using a value that fits a Windows C
+# long too. Readers never change and restore it while another reader is active.
+CSV_FIELD_LIMIT = 2**31 - 1
+csv.field_size_limit(CSV_FIELD_LIMIT)
+XLSX_TEXT_LIMIT = 32_767
 # Row-dict key (not a column) remembering which xlsx cells held numbers, so they
 # are written back as numbers rather than text.
 XLSX_NUMERIC_KEY = "\x00numeric"
@@ -94,6 +101,7 @@ CatalogueRow = dict[str, object]
 # Fixed width of the left-hand form column; the image takes whatever's left.
 FORM_WIDTH = 380
 COMPACT_WIDTH = 850
+SHORT_HEIGHT = 400
 PAGE_PADDING = 20
 THEME_PREFERENCE = "uma_bct_gui.theme_mode"
 logger = logging.getLogger(__name__)
@@ -241,7 +249,7 @@ def load_rows(path: Path) -> tuple[list[str], list[CatalogueRow]]:
     """Read a catalogue into (header order, row dicts of strings)."""
     try:
         return _load_xlsx(path) if path.suffix.lower() == ".xlsx" else _load_csv(path)
-    except (OSError, UnicodeError, csv.Error, BadZipFile, ParseError, ValueError, KeyError, EOFError) as ex:
+    except (OSError, UnicodeError, csv.Error, BadZipFile, ParseError, ValueError, TypeError, IndexError, KeyError, EOFError) as ex:
         raise CatalogueError(f"Could not read {path.name}: {ex}") from ex
 
 
@@ -260,6 +268,10 @@ def save_rows(
         if expected_revision is not None and original_revision != expected_revision:
             raise CatalogueError("The catalogue changed outside this app. Reopen the folder before saving.")
         original_mode = path.stat().st_mode if path.exists() else None
+        if original_mode is not None and not os.access(path, os.W_OK):
+            # Atomic replacement only requires a writable directory on POSIX.
+            # Respect the catalogue's own write permission as well.
+            raise PermissionError(errno.EACCES, "The catalogue is not writable", path)
         with tempfile.NamedTemporaryFile(
             prefix=f".{path.stem}-", suffix=path.suffix, dir=path.parent, delete=False
         ) as temporary_file:
@@ -299,7 +311,7 @@ def save_rows(
         else:
             message = f"{ex}. Check that the folder is available, then try Save again."
         raise CatalogueError(f"Could not save {path.name}: {message}") from ex
-    except (UnicodeError, csv.Error, BadZipFile, ParseError, ValueError, KeyError, EOFError) as ex:
+    except (UnicodeError, csv.Error, BadZipFile, ParseError, ValueError, TypeError, IndexError, KeyError, EOFError) as ex:
         raise CatalogueError(f"Could not save {path.name}: {ex}") from ex
     finally:
         if temporary_path is not None:
@@ -330,6 +342,13 @@ def _load_csv(path: Path) -> tuple[list[str], list[CatalogueRow]]:
 
 
 def _save_csv(path: Path, fieldnames: list[str], rows: list[CatalogueRow]) -> None:
+    if any(len(name) > CSV_FIELD_LIMIT for name in fieldnames) or any(
+        len(str(row.get(name) or "")) > CSV_FIELD_LIMIT for row in rows for name in fieldnames
+    ):
+        raise CatalogueError(
+            f"A CSV field is too long (maximum {CSV_FIELD_LIMIT:,} characters). "
+            "Shorten it and try Save again. Your edits are still available."
+        )
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -421,7 +440,8 @@ def _check_xlsx_headers(ws) -> None:
 def _load_xlsx(path: Path) -> tuple[list[str], list[CatalogueRow]]:
     openpyxl = _openpyxl()
     try:
-        wb = openpyxl.load_workbook(path)
+        with path.open("rb") as source:
+            wb = openpyxl.load_workbook(source)
     except openpyxl.utils.exceptions.InvalidFileException as ex:
         raise CatalogueError(f"Could not read {path.name}: {ex}") from ex
     try:
@@ -462,9 +482,18 @@ def _xlsx_value(name: str, text: str, numeric: set[str]) -> object:
     if name in numeric:
         for convert in (int, float):
             try:
-                return convert(text)
+                value = convert(text)
             except ValueError:
-                pass
+                continue
+            # Excel reliably stores 15 significant digits. Keep an edit as
+            # literal text if numeric storage would lose precision or spelling,
+            # including leading zeroes, whitespace, and nonfinite values.
+            if isinstance(value, int):
+                if str(value) == text and len(text.lstrip("-")) <= 15:
+                    return value
+            elif math.isfinite(value) and _cell_text(value) == text and format(value, ".15g") == text:
+                return value
+            break
     return text
 
 
@@ -477,7 +506,8 @@ def _save_xlsx(
 
     # Reload from disk and leave unchanged cells alone, preserving their types,
     # formulas, comments, formatting, and the rest of the workbook.
-    wb = openpyxl.load_workbook(path)
+    with path.open("rb") as source:
+        wb = openpyxl.load_workbook(source)
     try:
         ws = _catalogue_worksheet(wb)
         if ws.protection.sheet:
@@ -488,6 +518,8 @@ def _save_xlsx(
         for col, name in enumerate(fieldnames, start=1):
             header = ws.cell(1, col)
             if header.value is None:
+                if len(name) > XLSX_TEXT_LIMIT:
+                    raise CatalogueError("An Excel column name is too long (maximum 32,767 characters).")
                 header.value = name
                 if col > 1:
                     header._style = copy(ws.cell(1, col - 1)._style)
@@ -531,6 +563,12 @@ def _save_xlsx(
                 text = _cell_text(row.get(name))
                 if _xlsx_cell_text(name, cell) == text and not (name == REVIEWED_FIELD and cell.value is None):
                     continue
+                if len(text) > XLSX_TEXT_LIMIT:
+                    raise CatalogueError(
+                        f"The edited value in cell {cell.coordinate} is too long for Excel "
+                        "(maximum 32,767 characters). Shorten it and try Save again. "
+                        "Your edits are still available."
+                    )
                 if cell.value is None:
                     cell.alignment = Alignment(wrap_text=True, vertical="top")
                 if name == IMAGE_LINK_FIELD and text:
@@ -562,7 +600,7 @@ async def page_main(page: ft.Page) -> None:
     page.window.width = 1000
     page.window.height = 650
     page.window.min_width = 640
-    page.window.min_height = 480
+    page.window.min_height = 320
     page.window.prevent_close = True
     page.padding = PAGE_PADDING
     page.theme_mode = ft.ThemeMode.SYSTEM
@@ -582,6 +620,14 @@ async def page_main(page: ft.Page) -> None:
     flag_menu_open = False
     folder_picker_open = False
     catalogue_opening = False
+
+    def interaction_blocked() -> bool:
+        """Ignore events queued behind a modal or an outstanding native action."""
+        return folder_picker_open or catalogue_opening or any(dialog.open for dialog in modal_dialogs)
+
+    def has_current_record() -> bool:
+        return catalogue_path is not None and 0 <= current_index < len(rows)
+
     # Flet otherwise treats newly built controls with identical contents as the
     # old controls, leaving Python references detached after a record/folder change.
     control_keys = count()
@@ -616,7 +662,7 @@ async def page_main(page: ft.Page) -> None:
         page.window.brightness = ft.Brightness.DARK if dark else ft.Brightness.LIGHT
 
     async def toggle_theme(e: ft.Event) -> None:
-        if theme_btn.disabled:
+        if theme_btn.disabled or interaction_blocked():
             return
         dark = page.theme_mode == ft.ThemeMode.DARK or (
             page.theme_mode == ft.ThemeMode.SYSTEM and page.platform_brightness == ft.Brightness.DARK
@@ -670,6 +716,8 @@ async def page_main(page: ft.Page) -> None:
         chip.data = flag
 
         def on_delete(e: ft.Event) -> None:
+            if interaction_blocked() or not has_current_record() or chip not in flags_row.controls:
+                return
             flags_row.controls.remove(chip)
             refresh_add_flag_menu()
             page.update()
@@ -683,6 +731,8 @@ async def page_main(page: ft.Page) -> None:
 
         def pick(e: ft.Event) -> None:
             on_flag_menu_close(e)
+            if interaction_blocked() or not has_current_record():
+                return
             flags_row.controls.append(make_flag_chip(flag))
             refresh_add_flag_menu()
             page.update()
@@ -818,7 +868,8 @@ async def page_main(page: ft.Page) -> None:
                 # A delayed notification may be above this dialog. Close this
                 # instance, and ignore clicks queued during its closing animation.
                 dialog.open = False
-                page.update(dialog)
+                # Keep the form and overlays in the same page update.
+                page.update()
                 if callback:
                     callback()
 
@@ -826,6 +877,7 @@ async def page_main(page: ft.Page) -> None:
 
         dialog = ft.AlertDialog(
             modal=True,
+            scrollable=True,
             title=ft.Text(title),
             content=ft.Text(message),
             actions=[ft.TextButton(label, on_click=make_handler(cb)) for label, cb in options],
@@ -856,7 +908,7 @@ async def page_main(page: ft.Page) -> None:
         page.run_task(page.window.destroy)
 
     def on_window_event(e: ft.WindowEvent) -> None:
-        if e.type == ft.WindowEventType.CLOSE:
+        if e.type == ft.WindowEventType.CLOSE and not interaction_blocked():
             confirm_unsaved_changes("closing the window", close_window)
 
     page.window.on_event = on_window_event
@@ -933,9 +985,12 @@ async def page_main(page: ft.Page) -> None:
                 url_encoded=bool(row.get(XLSX_IMAGE_URL_KEY)),
             )
             if image_path:
-                image_bytes = image_path.read_bytes()
-                if not image_bytes:
-                    image_message = "Couldn't display this image: the file is empty"
+                if not stat.S_ISREG(image_path.stat().st_mode):
+                    image_message = "Couldn't read this image: the path is not a regular file"
+                else:
+                    image_bytes = image_path.read_bytes()
+                    if not image_bytes:
+                        image_message = "Couldn't display this image: the file is empty"
         except FileNotFoundError:
             image_message = "Image file not found"
         except (OSError, ValueError):
@@ -1010,7 +1065,8 @@ async def page_main(page: ft.Page) -> None:
         for name in form_fields:
             text_fields[name] = ft.TextField(
                 key=next(control_keys),
-                label=name,
+                label=ft.Text(name, max_lines=1, no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS),
+                tooltip=name,
                 multiline=name in MULTILINE_FIELDS,
                 min_lines=3 if name in MULTILINE_FIELDS else 1,
                 max_lines=6 if name in MULTILINE_FIELDS else 1,
@@ -1030,7 +1086,7 @@ async def page_main(page: ft.Page) -> None:
 
     async def on_open_folder(e: ft.Event) -> None:
         nonlocal folder_picker_open
-        if folder_picker_open:
+        if interaction_blocked():
             return
         folder_picker_open = True
         try:
@@ -1042,11 +1098,11 @@ async def page_main(page: ft.Page) -> None:
             return
         finally:
             folder_picker_open = False
-        if selected:
+        if selected and not interaction_blocked():
             confirm_unsaved_changes("opening another folder", lambda: load_folder(Path(selected)))
 
     def has_unsaved_changes() -> bool:
-        if current_index >= len(rows):
+        if not has_current_record():
             return False
         row = rows[current_index]
         if any((row.get(name) or "") != (text_fields[name].value or "") for name in form_fields):
@@ -1070,6 +1126,8 @@ async def page_main(page: ft.Page) -> None:
         return True
 
     def save_current() -> bool:
+        if not has_current_record():
+            return False
         row = rows[current_index].copy()
         for name in form_fields:
             row[name] = text_fields[name].value or ""
@@ -1081,10 +1139,14 @@ async def page_main(page: ft.Page) -> None:
 
     def go_to(index: int) -> None:
         nonlocal current_index
+        if interaction_blocked() or not 0 <= index < len(rows):
+            return
         current_index = index
         refresh()
 
     def on_save(e: ft.Event) -> None:
+        if interaction_blocked():
+            return
         if save_current():
             update_status()
             page.update()
@@ -1109,7 +1171,7 @@ async def page_main(page: ft.Page) -> None:
             page.update()
 
     def on_open_catalogue(e: ft.Event) -> None:
-        if catalogue_path is None or catalogue_opening or any(dialog.open for dialog in modal_dialogs):
+        if catalogue_path is None or interaction_blocked():
             return
         path = catalogue_path
 
@@ -1134,6 +1196,8 @@ async def page_main(page: ft.Page) -> None:
             open_saved()
 
     def on_discard_changes(e: ft.Event) -> None:
+        if interaction_blocked() or not has_current_record():
+            return
         ask(
             "Discard changes?",
             "Any unsaved edits to this box will be lost. Are you sure?",
@@ -1143,6 +1207,8 @@ async def page_main(page: ft.Page) -> None:
     def discard_box() -> None:
         # This crop wasn't a real record: drop the row from the catalogue entirely.
         nonlocal current_index
+        if not has_current_record():
+            return
         updated_rows = rows[:current_index] + rows[current_index + 1:]
         if not write_changes(updated_rows):
             return
@@ -1150,6 +1216,8 @@ async def page_main(page: ft.Page) -> None:
         refresh()
 
     def on_discard_box(e: ft.Event) -> None:
+        if interaction_blocked() or not has_current_record():
+            return
         ask(
             "Discard box?",
             "This permanently removes the box from the catalogue file. Are you sure?",
@@ -1157,6 +1225,8 @@ async def page_main(page: ft.Page) -> None:
         )
 
     def navigate(step: int) -> None:
+        if interaction_blocked():
+            return
         target = current_index + step
         if not 0 <= target < len(rows):
             return
@@ -1168,9 +1238,7 @@ async def page_main(page: ft.Page) -> None:
         step = {"Arrow Left": -1, "Arrow Right": 1}.get(e.key)
         if step is None or e.shift or e.ctrl or e.alt or e.meta:
             return
-        if focused_text_field is not None or flag_menu_open or folder_picker_open or catalogue_opening:
-            return
-        if any(dialog.open for dialog in modal_dialogs):
+        if focused_text_field is not None or flag_menu_open or interaction_blocked():
             return
         navigate(step)
 
@@ -1212,23 +1280,37 @@ async def page_main(page: ft.Page) -> None:
     content_area = ft.Column(
         controls=[body], expand=True, horizontal_alignment=ft.CrossAxisAlignment.STRETCH
     )
+    root_column = ft.Column(
+        controls=[ft.Column([top_bar, catalogue_text], spacing=4), content_area, buttons_row],
+        expand=True,
+        spacing=16,
+        # Stretch the content and empty-state message across the window.
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+    )
 
     def update_layout(e: ft.PageResizeEvent | None = None) -> None:
-        width = e.width if e else page.width or page.window.width
+        width = (e.width if e else page.width) or page.window.width
+        height = (getattr(e, "height", None) if e else getattr(page, "height", None)) or page.window.height
         compact = width < COMPACT_WIDTH
+        short = height < SHORT_HEIGHT
         # Keep the same parents: reparenting live Flet controls detaches their
         # client methods (including zoom), even if they still appear on screen.
+        # Very short workspaces scroll the whole page so the header and footer
+        # cannot squeeze the form into a tiny or unreachable viewport.
+        root_column.scroll = ft.ScrollMode.AUTO if short else None
+        content_area.expand = None if short else True
+        content_area.tight = short
         body.wrap = compact
-        body.expand = None if compact else True
-        content_area.scroll = ft.ScrollMode.AUTO if compact else None
+        body.expand = None if compact or short else True
+        content_area.scroll = ft.ScrollMode.AUTO if compact and not short else None
         form_column.width = width - PAGE_PADDING * 2 if compact else FORM_WIDTH
-        form_column.scroll = None if compact else ft.ScrollMode.AUTO
-        form_column.tight = compact
+        form_column.scroll = None if compact or short else ft.ScrollMode.AUTO
+        form_column.tight = compact or short
         image_column.expand = None if compact else True
-        image_column.tight = compact
+        image_column.tight = compact or short
         image_column.width = width - PAGE_PADDING * 2 if compact else None
-        image_area.expand = None if compact else True
-        image_area.height = 320 if compact else None
+        image_area.expand = None if compact or short else True
+        image_area.height = 320 if compact or short else None
         if e:
             page.update()
 
@@ -1236,16 +1318,7 @@ async def page_main(page: ft.Page) -> None:
     update_layout()
     update_theme_button()
 
-    page.add(
-        ft.Column(
-            controls=[ft.Column([top_bar, catalogue_text], spacing=4), content_area, buttons_row],
-            expand=True,
-            spacing=16,
-            # Without this, children only take their natural width and the
-            # centered empty-state message ends up hugging the left edge.
-            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-        )
-    )
+    page.add(root_column)
 
     refresh()
     try:

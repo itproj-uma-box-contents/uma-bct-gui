@@ -5,7 +5,7 @@ description = "GUI for manually verifying VLM-transcribed UMA box catalogue outp
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "flet[desktop]>=1.0.1",
+    "flet[desktop]>=1.0.4",
     "openpyxl>=3.1",
 ]
 

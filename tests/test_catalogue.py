@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import main
 
@@ -136,6 +137,47 @@ class CatalogueTests(CatalogueTestCase):
         self.assertEqual(saved_fields, fields)
         self.assertEqual(saved_rows, rows)
         self.assert_no_temp_files(path)
+
+    def test_csv_round_trip_supports_fields_beyond_the_default_parser_limit(self):
+        path = self.write_csv()
+        fields, rows = main.load_rows(path)
+        for length in (131_072, 131_073, 262_144):
+            with self.subTest(length=length):
+                rows[0]["Description"] = "x" * length
+                main.save_rows(path, fields, rows)
+                self.assertEqual(main.load_rows(path)[1][0]["Description"], rows[0]["Description"])
+        self.assert_no_temp_files(path)
+
+    def test_write_access_denial_preserves_catalogue_and_can_be_retried(self):
+        path = self.write_csv()
+        fields, rows = main.load_rows(path)
+        original = path.read_bytes()
+        rows[0]["Description"] = "Retry this correction"
+        with patch("main.os.access", return_value=False):
+            with self.assertRaisesRegex(main.CatalogueError, "writable"):
+                main.save_rows(path, fields, rows)
+        self.assertEqual(path.read_bytes(), original)
+        self.assert_no_temp_files(path)
+        main.save_rows(path, fields, rows)
+        self.assertEqual(main.load_rows(path)[1][0]["Description"], "Retry this correction")
+
+    @unittest.skipIf(os.name == "nt", "POSIX file mode permissions")
+    def test_read_only_catalogue_preserves_bytes_and_allows_retry_after_chmod(self):
+        path = self.write_csv()
+        fields, rows = main.load_rows(path)
+        original = path.read_bytes()
+        rows[0]["Description"] = "Retry this correction"
+        path.chmod(0o444)
+        self.addCleanup(path.chmod, 0o644)
+        if os.access(path, os.W_OK):
+            self.skipTest("The current user can write read-only files")
+        with self.assertRaisesRegex(main.CatalogueError, "writable"):
+            main.save_rows(path, fields, rows)
+        self.assertEqual(path.read_bytes(), original)
+        self.assert_no_temp_files(path)
+        path.chmod(0o644)
+        main.save_rows(path, fields, rows)
+        self.assertEqual(main.load_rows(path)[1][0]["Description"], "Retry this correction")
 
     def test_csv_accepts_utf8_bom(self):
         path = self.write_csv()
@@ -455,6 +497,47 @@ class ExcelCatalogueTests(CatalogueTestCase):
         self.assertEqual(workbook["Notes"]["A1"].value, "Other sheet stays intact")
         self.assert_no_temp_files(path)
 
+    def test_xlsx_numeric_edits_preserve_literal_spelling_and_precision(self):
+        for text, expected, data_type in (
+            ("13", 13, "n"),
+            ("12.5", 12.5, "n"),
+            ("-13", -13, "n"),
+            ("0012", "0012", "s"),
+            ("12345678901234567890", "12345678901234567890", "s"),
+            ("0.12345678901234567", "0.12345678901234567", "s"),
+            ("NaN", "NaN", "s"),
+            ("Infinity", "Infinity", "s"),
+            ("-Infinity", "-Infinity", "s"),
+            ("12.0", "12.0", "s"),
+            (" 12", " 12", "s"),
+        ):
+            with self.subTest(text=text):
+                path = self.write_workbook()
+                fields, rows = main.load_rows(path)
+                rows[0]["Count"] = text
+                main.save_rows(path, fields, rows)
+                saved = self.read_workbook(path)
+                self.assertEqual(saved.active["D2"].value, expected)
+                self.assertEqual(saved.active["D2"].data_type, data_type)
+                self.assertEqual(saved.active["D2"].number_format, "0.00")
+                self.assertEqual(main.load_rows(path)[1][0]["Count"], text)
+
+    def test_xlsx_rejects_oversized_edited_text_without_truncation_or_replacement(self):
+        path = self.write_workbook()
+        fields, rows = main.load_rows(path)
+        rows[0]["Description"] = "x" * 32_767
+        main.save_rows(path, fields, rows)
+        self.assertEqual(main.load_rows(path)[1][0]["Description"], rows[0]["Description"])
+        original = path.read_bytes()
+        original_position = rows[0][main.XLSX_ROW_KEY]
+        rows[0]["Description"] += "x"
+        with self.assertRaisesRegex(main.CatalogueError, "32,767"):
+            main.save_rows(path, fields, rows)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(len(rows[0]["Description"]), 32_768)
+        self.assertEqual(rows[0][main.XLSX_ROW_KEY], original_position)
+        self.assert_no_temp_files(path)
+
     def test_xlsx_preserves_and_saves_literal_equals_text(self):
         path = self.write_workbook()
         workbook = self.read_workbook(path)
@@ -588,6 +671,29 @@ class ExcelCatalogueTests(CatalogueTestCase):
 
         with self.assertRaises(main.CatalogueError):
             main.load_rows(path)
+
+    def test_malformed_xlsx_metadata_and_cell_indices_have_readable_errors(self):
+        for entry, before, after in (
+            ("xl/workbook.xml", b'sheetId="1"', b'sheetId="bad"'),
+            ("xl/worksheets/sheet1.xml", b'<c r="A2" s="1"', b'<c r="A2" s="99999"'),
+            ("xl/worksheets/sheet1.xml", b't="inlineStr"><is><t>Original description</t></is>', b't="s"><v>99999</v>'),
+        ):
+            with self.subTest(entry=entry, after=after):
+                path = self.write_workbook()
+                with ZipFile(path) as archive:
+                    contents = {name: archive.read(name) for name in archive.namelist()}
+                self.assertIn(before, contents[entry])
+                contents[entry] = contents[entry].replace(before, after, 1)
+                with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+                    for name, content in contents.items():
+                        archive.writestr(name, content)
+                original = path.read_bytes()
+                with self.assertRaisesRegex(main.CatalogueError, "Could not read"):
+                    main.load_rows(path)
+                with self.assertRaisesRegex(main.CatalogueError, "Could not save"):
+                    main.save_rows(path, self.fields, [])
+                self.assertEqual(path.read_bytes(), original)
+                self.assert_no_temp_files(path)
 
 
 if __name__ == "__main__":
