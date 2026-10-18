@@ -330,7 +330,7 @@ def run():
                 assert heading.label.max_lines == 1 and heading.label.no_wrap
                 assert heading.tooltip == LONG_FIELD_NAME
 
-                for width, height in ((640, 360), (1000, 360), (700, 900), (1400, 500), (640, 480), (1000, 650)):
+                for width, height in ((640, 320), (640, 360), (1000, 360), (700, 900), (1400, 500), (640, 480), (1000, 650)):
                     print(f"Checking native layout {width} × {height}", flush=True)
                     await resize_window(page, width, height, layout_events=layout_events)
                     assert description.value == "Unsaved layout correction — café"
